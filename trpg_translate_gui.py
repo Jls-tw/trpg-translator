@@ -13,6 +13,7 @@ TRPG 規則書翻譯工具：圖形介面 (Tkinter，Python 內建，不需額�
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
@@ -56,6 +57,8 @@ except Exception as _e:  # 缺檔或缺套件時給出看得懂的訊息
     sys.exit(1)
 
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
+LIST_H0, LOG_H0 = 150, 190   # PDF 清單 / 執行記錄 的初始高度（像素）
+LIST_MIN, LOG_MIN = 90, 80   # 兩者可縮到的最小高度
 ENV_FILE = APP_DIR / ".env"
 try:
     from dotenv import load_dotenv
@@ -65,6 +68,15 @@ except ImportError:
     pass
 STATUS_TEXT = {"complete": "完成", "partial": "部分完成", "stopped": "已停止", "error": "錯誤"}
 THINKING_CHOICES = ["none", "minimal", "low", "medium", "high"]
+# 現行 Gemini 3 系列中，可用於「讀 PDF 並輸出文字譯文」的型號（Live / TTS / 圖片 / 轉錄 / Omni 等型號不適用）
+MODEL_CHOICES = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+]
 
 
 # ============================================================
@@ -162,12 +174,20 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("TRPG 規則書翻譯工具")
-        root.geometry("1020x800")
-        root.minsize(920, 700)
+        root.geometry("1020x860")
+        root.minsize(920, 560)
+        self._drag = None
 
         self.q: "queue.Queue" = queue.Queue()
         self.books: Dict[str, dict] = {}
-        self.running = False
+        self.running = False          # 背景工作執行緒正在翻譯
+        self.waiting = False          # 排程：等待開始時間中
+        self.run_token = None         # 這一輪工作的識別物件（強制停止後，舊工作的事件會被忽略）
+        self.km = None                # 目前工作使用的 KeyManager（「重設 Key 計時」用）
+        self.sched: Optional[dict] = None
+        self.pending: Optional[dict] = None
+        self.end_ts: Optional[float] = None
+        self._end_signaled = False
         self.cur: Optional[dict] = None
         self.file_handler: Optional[logging.Handler] = None
         self.keys: List[str] = parse_keys(os.environ.get("GEMINI_API_KEYS", ""))
@@ -182,6 +202,8 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll()
         self.refresh_stats()
+        self._sched_tick()
+        root.after(250, self._init_layout)
 
     # ---------- 樣式 ----------
     def _setup_style(self) -> None:
@@ -200,6 +222,7 @@ class App:
         style.configure("Treeview", rowheight=26)
         style.configure("Start.TButton", font=(ui_family, 11, "bold"), padding=(14, 6))
         style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Danger.TButton", foreground="#b91c1c")
 
     # ---------- 變數 ----------
     def _init_vars(self) -> None:
@@ -223,19 +246,35 @@ class App:
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text = tk.StringVar(value="尚未開始")
         self.status_var = tk.StringVar(value="就緒")
+        # 排程
+        self.sched_start_on = tk.BooleanVar(value=False)
+        self.sched_start_h = tk.StringVar(value="23")
+        self.sched_start_m = tk.StringVar(value="00")
+        self.sched_end_on = tk.BooleanVar(value=False)
+        self.sched_end_h = tk.StringVar(value="06")
+        self.sched_end_m = tk.StringVar(value="00")
+        self.sched_daily = tk.BooleanVar(value=False)
+        self.sched_text = tk.StringVar(value="")
 
     # ---------- 介面 ----------
     def _build_ui(self) -> None:
         root = self.root
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=2)
-        root.rowconfigure(4, weight=3)
+        # 版面（由上到下）：0 PDF 清單｜1 清單拖曳條｜2 設定｜3 操作列｜4 進度｜5 執行記錄｜6 記錄拖曳條｜7 狀態列
+        # 視窗放大時，PDF 清單與執行記錄平均分配多出來的高度；
+        # 各自下方的拖曳條可「單獨」調整該框高度（視窗高度會跟著增減，不會去擠壓另一個框）。
+        root.rowconfigure(0, weight=1)
+        root.rowconfigure(5, weight=1)
 
         # --- ① PDF 清單 ---
         box = ttk.LabelFrame(root, text=" ① 要翻譯的 PDF ", padding=8)
-        box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
+        box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
+        box.grid_propagate(False)       # 高度由拖曳條控制，不被內容撐大
+        box.configure(height=LIST_H0)
+        self.list_frame = box
+        self._make_grip(1, "list")
 
         cols = ("name", "total", "done", "failed", "status")
         self.tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="extended", height=5)
@@ -263,12 +302,13 @@ class App:
         for b in self.list_buttons:
             b.pack(fill="x", pady=2)
         ttk.Button(btns, text="開啟譯文 / 資料夾", command=self.on_open_result).pack(fill="x", pady=(14, 2))
-        ttk.Label(box, text="未選取任何項目時，會處理清單中的全部 PDF；雙擊可開啟譯文。",
+        ttk.Label(box, text="未選取任何項目時，會處理清單中的全部 PDF；雙擊可開啟譯文。"
+                            "拖曳各框下方的橫條，可分別調整清單與執行記錄的高度。",
                   style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        # --- ②③④ 設定 ---
+        # --- ②③④⑤ 設定 ---
         mid = ttk.Frame(root)
-        mid.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        mid.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
         mid.columnconfigure(0, weight=3)
         mid.columnconfigure(1, weight=2)
 
@@ -283,8 +323,8 @@ class App:
             widget.grid(row=r, column=c + 1, sticky="ew", padx=(0, 12), pady=3)
             self.settings_widgets.append(widget)
 
-        add_row(0, 0, "模型", ttk.Combobox(sf, textvariable=self.model_var, width=24, values=[
-            engine.Config.model, "gemini-2.5-flash", "gemini-2.5-flash-lite"]))
+        model_values = [engine.Config.model] + [m for m in MODEL_CHOICES if m != engine.Config.model]
+        add_row(0, 0, "模型", ttk.Combobox(sf, textvariable=self.model_var, width=24, values=model_values))
         add_row(0, 2, "思考強度", ttk.Combobox(sf, textvariable=self.thinking_var, width=10,
                                               values=THINKING_CHOICES, state="readonly"))
         add_row(1, 0, "單次逾時（秒）", ttk.Spinbox(sf, from_=10, to=900, increment=10, textvariable=self.timeout_var, width=8))
@@ -294,6 +334,9 @@ class App:
         add_row(3, 0, "起始 Key 編號", ttk.Spinbox(sf, from_=1, to=99, textvariable=self.startkey_var, width=8))
         add_row(3, 2, "PDF 傳送方式", ttk.Combobox(sf, textvariable=self.transport_var, width=10,
                                                   values=["files", "inline"], state="readonly"))
+        ttk.Label(sf, text="免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。也可直接輸入其他型號名稱。",
+                  style="Hint.TLabel", wraplength=560, justify="left").grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(2, 4))
         for i, (var, text) in enumerate((
             (self.prev_var, "附上上一頁 PDF 當上下文（品質較好，成本約 2 倍）"),
             (self.join_var, "合併時接回被分頁切斷的段落"),
@@ -301,7 +344,7 @@ class App:
             (self.move_var, "全部完成後，把原始 PDF 移進輸出資料夾"),
         )):
             cb = ttk.Checkbutton(sf, text=text, variable=var)
-            cb.grid(row=4 + i, column=0, columnspan=4, sticky="w", pady=1)
+            cb.grid(row=5 + i, column=0, columnspan=4, sticky="w", pady=1)
             self.settings_widgets.append(cb)
 
         right = ttk.Frame(mid)
@@ -327,40 +370,117 @@ class App:
         self.out_entry.grid(row=0, column=0, sticky="ew")
         self.out_browse = ttk.Button(of, text="瀏覽…", width=7, command=self.on_browse_out)
         self.out_browse.grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(of, text="開啟資料夾", width=10, command=self.on_open_out).grid(row=0, column=2, padx=(6, 0))
         ttk.Label(of, text="譯文與進度會存在此資料夾下的「書名」子資料夾。",
-                  style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                  style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        sc = ttk.LabelFrame(right, text=" ⑤ 排程（選用） ", padding=8)
+        sc.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        for r, (on_var, text, hv, mv) in enumerate((
+            (self.sched_start_on, "開始時間", self.sched_start_h, self.sched_start_m),
+            (self.sched_end_on, "結束時間", self.sched_end_h, self.sched_end_m),
+        )):
+            cb = ttk.Checkbutton(sc, text=text, variable=on_var)
+            cb.grid(row=r, column=0, sticky="w", pady=2)
+            hs = ttk.Spinbox(sc, from_=0, to=23, wrap=True, width=3, format="%02.0f", textvariable=hv)
+            ms = ttk.Spinbox(sc, from_=0, to=59, wrap=True, width=3, format="%02.0f", textvariable=mv)
+            hs.grid(row=r, column=1, padx=(10, 0))
+            ttk.Label(sc, text=":").grid(row=r, column=2, padx=2)
+            ms.grid(row=r, column=3)
+            self.settings_widgets += [cb, hs, ms]
+        dc = ttk.Checkbutton(sc, text="每天重複（需同時勾選開始與結束）", variable=self.sched_daily)
+        dc.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+        self.settings_widgets.append(dc)
+        ttk.Label(sc, textvariable=self.sched_text, style="Hint.TLabel", wraplength=330,
+                  justify="left").grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # --- 操作列 ---
         bar = ttk.Frame(root)
-        bar.grid(row=2, column=0, sticky="ew", padx=10, pady=6)
+        bar.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
         self.start_btn = ttk.Button(bar, text="▶ 開始翻譯", style="Start.TButton", command=self.on_start)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(bar, text="■ 停止", command=self.on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=8)
+        self.force_btn = ttk.Button(bar, text="強制停止", style="Danger.TButton",
+                                    command=self.on_force_stop, state="disabled")
+        self.force_btn.pack(side="left")
         self.merge_btn = ttk.Button(bar, text="重組 Markdown", command=self.on_merge)
-        self.merge_btn.pack(side="left")
+        self.merge_btn.pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="管理 Key…", command=self.on_manage_keys).pack(side="right")
+        ttk.Button(bar, text="重設 Key 計時", command=self.on_reset_keys).pack(side="right", padx=(0, 6))
         ttk.Label(bar, textvariable=self.key_var).pack(side="right", padx=10)
 
         # --- 進度 ---
         pf = ttk.Frame(root)
-        pf.grid(row=3, column=0, sticky="ew", padx=10)
+        pf.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 6))
         pf.columnconfigure(0, weight=1)
         ttk.Progressbar(pf, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
         ttk.Label(pf, textvariable=self.progress_text).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        # --- 記錄 ---
+        # --- 記錄（下半部）---
         lf = ttk.LabelFrame(root, text=" 執行記錄 ", padding=4)
-        lf.grid(row=4, column=0, sticky="nsew", padx=10, pady=(8, 4))
+        lf.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 0))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
-        self.log_text = ScrolledText(lf, height=10, state="disabled", wrap="word", font=self.log_font)
+        lf.grid_propagate(False)
+        lf.configure(height=LOG_H0)
+        self.log_frame = lf
+        self.log_text = ScrolledText(lf, height=8, state="disabled", wrap="word", font=self.log_font)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         self.log_text.tag_configure("warn", foreground="#b45309")
         self.log_text.tag_configure("error", foreground="#b91c1c")
 
+        self._make_grip(6, "log")
+
         ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).grid(
-            row=5, column=0, sticky="ew")
+            row=7, column=0, sticky="ew")
+
+    def _init_layout(self) -> None:
+        """依實際內容決定視窗初始高度與最小高度。"""
+        try:
+            self.root.update_idletasks()
+            req_h = self.root.winfo_reqheight()
+            fixed = req_h - LIST_H0 - LOG_H0  # 設定、操作列、進度、狀態列等固定區塊的總高度
+            self.root.minsize(920, fixed + LIST_MIN + LOG_MIN)
+            self.root.geometry(f"1020x{min(req_h, self.root.winfo_screenheight() - 90)}")
+        except tk.TclError:
+            pass
+
+    # ---------- 可拖曳調整高度的橫條 ----------
+    def _make_grip(self, row: int, which: str) -> None:
+        g = tk.Frame(self.root, height=9, bd=2, relief="ridge", cursor="sb_v_double_arrow")
+        g.grid(row=row, column=0, sticky="ew", padx=10, pady=(2, 2))
+        g.bind("<ButtonPress-1>", lambda e, k=which: self._grip_press(k, e))
+        g.bind("<B1-Motion>", self._grip_drag)
+        g.bind("<ButtonRelease-1>", self._grip_release)
+
+    def _grip_frame(self, which: str):
+        return self.list_frame if which == "list" else self.log_frame
+
+    def _grip_press(self, which: str, event) -> None:
+        # 先把兩個框「凍結」成目前實際高度，之後只改被拖曳的那一個，並同步增減視窗高度
+        for f in (self.list_frame, self.log_frame):
+            f.configure(height=max(int(f.winfo_height()), 1))
+        self._drag = {"which": which, "y0": event.y_root,
+                      "h0": int(self._grip_frame(which).winfo_height()),
+                      "win_h0": int(self.root.winfo_height())}
+
+    def _grip_drag(self, event) -> None:
+        d = self._drag
+        if not d:
+            return
+        min_h = LIST_MIN if d["which"] == "list" else LOG_MIN
+        want = d["h0"] + (event.y_root - d["y0"])
+        delta = max(want, min_h) - d["h0"]
+        win_lo = int(self.root.minsize()[1])
+        win_hi = max(win_lo, int(self.root.winfo_screenheight()) - 90)  # 不超出螢幕
+        win_h = min(max(d["win_h0"] + delta, win_lo), win_hi)
+        delta = win_h - d["win_h0"]
+        self._grip_frame(d["which"]).configure(height=d["h0"] + delta)
+        self.root.geometry(f"{int(self.root.winfo_width())}x{win_h}")
+
+    def _grip_release(self, event) -> None:
+        self._drag = None
 
     def _setup_logging(self) -> None:
         engine.log.setLevel(logging.DEBUG)
@@ -371,7 +491,9 @@ class App:
         data = engine.load_json(SETTINGS_FILE, {})
         pairs = [("model", self.model_var), ("thinking", self.thinking_var), ("timeout", self.timeout_var),
                  ("interval", self.interval_var), ("max_fails", self.maxfails_var), ("consec", self.consec_var),
-                 ("start_key", self.startkey_var), ("transport", self.transport_var), ("out", self.out_var)]
+                 ("start_key", self.startkey_var), ("transport", self.transport_var), ("out", self.out_var),
+                 ("sched_start_h", self.sched_start_h), ("sched_start_m", self.sched_start_m),
+                 ("sched_end_h", self.sched_end_h), ("sched_end_m", self.sched_end_m)]
         for k, var in pairs:
             if k not in data:
                 continue
@@ -379,7 +501,9 @@ class App:
                 continue  # 舊版預設 90 秒會把「慢但會成功」的請求砍成 504，載入時忽略
             var.set(str(data[k]))
         for k, var in (("prev", self.prev_var), ("join", self.join_var),
-                       ("markers", self.markers_var), ("move", self.move_var)):
+                       ("markers", self.markers_var), ("move", self.move_var),
+                       ("sched_start_on", self.sched_start_on), ("sched_end_on", self.sched_end_on),
+                       ("sched_daily", self.sched_daily)):
             if k in data:
                 var.set(bool(data[k]))
         for p in data.get("pdfs", []):
@@ -394,6 +518,10 @@ class App:
             "start_key": self.startkey_var.get(), "transport": self.transport_var.get(), "out": self.out_var.get(),
             "prev": self.prev_var.get(), "join": self.join_var.get(),
             "markers": self.markers_var.get(), "move": self.move_var.get(),
+            "sched_start_on": self.sched_start_on.get(), "sched_start_h": self.sched_start_h.get(),
+            "sched_start_m": self.sched_start_m.get(), "sched_end_on": self.sched_end_on.get(),
+            "sched_end_h": self.sched_end_h.get(), "sched_end_m": self.sched_end_m.get(),
+            "sched_daily": self.sched_daily.get(),
             "pdfs": [str(b["path"]) for b in self.books.values()],
         }
         try:
@@ -463,8 +591,8 @@ class App:
 
     # ---------- Key 管理 ----------
     def on_manage_keys(self) -> None:
-        if self.running:
-            messagebox.showinfo("進行中", "翻譯進行中，請先停止再修改 Key。")
+        if self.running or self.waiting:
+            messagebox.showinfo("進行中", "翻譯進行中（或排程等待中），請先停止再修改 Key。")
             return
         win = tk.Toplevel(self.root)
         win.title("管理 API Key")
@@ -564,19 +692,20 @@ class App:
         return cfg
 
     # ---------- 開始 / 停止 ----------
-    def _set_running_ui(self, running: bool) -> None:
-        self.running = running
-        self.start_btn.configure(state="disabled" if running else "normal")
-        self.stop_btn.configure(state="normal" if running else "disabled")
-        self.merge_btn.configure(state="disabled" if running else "normal")
+    def _set_busy_ui(self, busy: bool) -> None:
+        """busy = 執行中或排程等待中：鎖住設定、啟用停止按鈕。"""
+        self.start_btn.configure(state="disabled" if busy else "normal")
+        self.stop_btn.configure(state="normal" if busy else "disabled")
+        self.force_btn.configure(state="normal" if busy else "disabled")
+        self.merge_btn.configure(state="disabled" if busy else "normal")
         for w in self.list_buttons + [self.out_browse, self.out_entry] + self.settings_widgets + self.range_widgets:
             try:
-                w.state(["disabled"] if running else ["!disabled"])
+                w.state(["disabled"] if busy else ["!disabled"])
             except Exception:
                 pass
 
     def on_start(self) -> None:
-        if self.running:
+        if self.running or self.waiting:
             return
         if not self.keys:
             messagebox.showwarning("尚未設定 API Key", "請先按「管理 Key…」貼上至少一把 Gemini API Key。")
@@ -588,6 +717,11 @@ class App:
         cfg = self.build_config(len(targets))
         if cfg is None:
             return
+        try:
+            sched = self._read_schedule()
+        except ValueError as e:
+            messagebox.showerror("排程設定有誤", str(e))
+            return
         out = Path(self.out_var.get().strip() or self.books[targets[0]]["path"].parent)
         try:
             out.mkdir(parents=True, exist_ok=True)
@@ -598,51 +732,248 @@ class App:
         cfg.output_root = str(out)
         self.save_settings()
 
-        self.file_handler = logging.FileHandler(out / "translator.log", encoding="utf-8")
+        self.pending = {"targets": targets, "jobs": [(iid, self.books[iid]["path"]) for iid in targets],
+                        "cfg": cfg, "keys": list(self.keys), "out": out}
+        if sched["start"]:
+            start_ts = self._next_occurrence(sched["start"][0], sched["start"][1], time.time())
+            self.sched = dict(sched, start_ts=start_ts)
+            self.waiting = True
+            self._set_busy_ui(True)
+            self._update_sched_text(time.time())
+            engine.log.info("已設定排程，將於 %s 開始。電腦需保持開機且不要睡眠。", self._fmt_ts(start_ts))
+        else:
+            self.sched = dict(sched, start_ts=None) if sched["end"] else None
+            self._launch()
+
+    def _launch(self) -> None:
+        """實際開始翻譯（立即開始，或排程時間到）。"""
+        p = self.pending
+        if not p:
+            return
+        sched = self.sched
+        self.end_ts = None
+        if sched and sched.get("end"):
+            self.end_ts = self._next_occurrence(sched["end"][0], sched["end"][1], time.time())
+        self._end_signaled = False
+
+        self._detach_file_handler()
+        self.file_handler = logging.FileHandler(Path(p["out"]) / "translator.log", encoding="utf-8")
         self.file_handler.setLevel(logging.DEBUG)
         self.file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         engine.log.addHandler(self.file_handler)
 
         engine.STOP.clear()
-        for iid in targets:
-            self.books[iid]["status"] = "排隊中"
-        self._set_running_ui(True)
+        self.run_token = object()
+        self.running = True
+        self.waiting = False
+        for iid in p["targets"]:
+            if iid in self.books:
+                self.books[iid]["status"] = "排隊中"
+        self._set_busy_ui(True)
         self.status_var.set("翻譯中…")
-        jobs = [(iid, self.books[iid]["path"]) for iid in targets]
-        threading.Thread(target=self._worker, args=(jobs, cfg, list(self.keys)), daemon=True).start()
+        if self.end_ts:
+            engine.log.info("本輪將於 %s 自動停止。", self._fmt_ts(self.end_ts))
+        threading.Thread(target=self._worker, args=(self.run_token, p["jobs"], p["cfg"], p["keys"]),
+                         daemon=True).start()
 
     def on_stop(self) -> None:
+        """安全停止：等目前這次請求結束後才停（也會取消排程的每日重複）。"""
+        if self.waiting and not self.running:
+            self._cancel_waiting("已取消排程")
+            return
+        if not self.running:
+            return
+        self.sched = None
         engine.STOP.set()
         self.stop_btn.configure(state="disabled")
-        self.status_var.set("正在停止…將在目前這次請求結束後安全停止（最久約等於「單次逾時」秒數）")
+        self.status_var.set("正在停止…將在目前這次請求結束後安全停止（最久約等於「單次逾時」秒數）。"
+                            "不想等可按「強制停止」。")
 
-    def _worker(self, jobs, cfg, keys) -> None:
+    def on_force_stop(self) -> None:
+        """強制停止：立刻放棄目前進行中的請求，不等回應。"""
+        if not (self.running or self.waiting):
+            return
+        if self.waiting and not self.running:
+            self._cancel_waiting("已取消排程")
+            return
+        if not messagebox.askyesno(
+                "強制停止",
+                "強制停止會立刻放棄目前正在等待回應的請求（它的結果會被丟棄，仍可能消耗一次額度）。\n"
+                "已完成的頁面都已存檔，不受影響，下次可續傳。\n\n確定要強制停止嗎？"):
+            return
+        engine.abort_all()
+        self.run_token = None
+        self.running = False
+        self.waiting = False
+        self.sched = None
+        self.pending = None
+        self.end_ts = None
+        self._end_signaled = False
+        self.cur = None
+        self.km = None
+        self._detach_file_handler()
+        for b in self.books.values():
+            if b["status"] in ("排隊中", "翻譯中"):
+                b["status"] = "已強制停止"
+        self._set_busy_ui(False)
+        self.refresh_stats(once=True)
+        engine.log.warning("已強制停止。背景中尚未回應的請求會被丟棄。")
+        self.status_var.set("已強制停止")
+
+    def _cancel_waiting(self, msg: str) -> None:
+        self.waiting = False
+        self.sched = None
+        self.pending = None
+        self._set_busy_ui(False)
+        self._update_sched_text(time.time())
+        engine.log.info(msg)
+        self.status_var.set(msg)
+
+    def _detach_file_handler(self) -> None:
+        if self.file_handler is not None:
+            engine.log.removeHandler(self.file_handler)
+            self.file_handler.close()
+            self.file_handler = None
+
+    # ---------- 排程 ----------
+    @staticmethod
+    def _next_occurrence(h: int, m: int, after_ts: float) -> float:
+        """after_ts 之後第一個「時:分」的時間點（已過就算明天）。"""
+        dt = datetime.datetime.fromtimestamp(after_ts).replace(hour=h, minute=m, second=0, microsecond=0)
+        if dt.timestamp() <= after_ts:
+            dt += datetime.timedelta(days=1)
+        return dt.timestamp()
+
+    @staticmethod
+    def _fmt_ts(ts: float) -> str:
+        return datetime.datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
+
+    def _read_schedule(self) -> dict:
+        """讀取排程設定；格式錯誤時拋出 ValueError。"""
+        def hm(on, hv, mv, label):
+            if not on.get():
+                return None
+            return (self._num(hv, f"{label}（時）", 0, 23), self._num(mv, f"{label}（分）", 0, 59))
+        start = hm(self.sched_start_on, self.sched_start_h, self.sched_start_m, "開始時間")
+        end = hm(self.sched_end_on, self.sched_end_h, self.sched_end_m, "結束時間")
+        daily = bool(self.sched_daily.get())
+        if daily and not (start and end):
+            raise ValueError("「每天重複」需要同時勾選「開始時間」與「結束時間」。")
+        return {"start": start, "end": end, "daily": daily}
+
+    def _sched_tick(self) -> None:
+        """每秒檢查：到開始時間就啟動；到結束時間就安全停止。"""
+        try:
+            now = time.time()
+            if self.waiting and self.sched and self.sched.get("start_ts") and now >= self.sched["start_ts"]:
+                engine.log.info("已到排程開始時間，開始翻譯。")
+                self._launch()
+            elif self.running and self.end_ts and not self._end_signaled and now >= self.end_ts:
+                self._end_signaled = True
+                engine.log.info("已到排程結束時間，將在目前這次請求結束後停止。")
+                engine.STOP.set()
+                self.stop_btn.configure(state="disabled")
+            self._update_sched_text(now)
+        except Exception:
+            pass
+        self.root.after(1000, self._sched_tick)
+
+    def _update_sched_text(self, now: float) -> None:
+        if self.waiting and self.sched and self.sched.get("start_ts"):
+            st = self.sched["start_ts"]
+            t = f"排程等待中：{self._fmt_ts(st)} 開始（還有 {fmt_dur(st - now)}）"
+            if self.sched.get("end"):
+                t += f"，{self._fmt_ts(self._next_occurrence(self.sched['end'][0], self.sched['end'][1], st))} 停止"
+            self.sched_text.set(t)
+            self.status_var.set(t)
+        elif self.running and self.end_ts:
+            self.sched_text.set(f"執行中：將於 {self._fmt_ts(self.end_ts)} 自動停止（還有 {fmt_dur(self.end_ts - now)}）")
+        elif self.running or self.waiting:
+            self.sched_text.set("")
+        else:
+            try:
+                sc = self._read_schedule()
+            except ValueError as e:
+                self.sched_text.set(str(e))
+                return
+            if not sc["start"] and not sc["end"]:
+                self.sched_text.set("未設定排程：按「開始翻譯」會立即開始，做完為止。")
+                return
+            base, parts = now, []
+            if sc["start"]:
+                base = self._next_occurrence(sc["start"][0], sc["start"][1], now)
+                parts.append(f"{self._fmt_ts(base)} 開始")
+            else:
+                parts.append("立即開始")
+            if sc["end"]:
+                parts.append(f"{self._fmt_ts(self._next_occurrence(sc['end'][0], sc['end'][1], base))} 停止")
+            self.sched_text.set("預計：" + "，".join(parts) + ("（每天重複）" if sc["daily"] else ""))
+
+    # ---------- 開啟輸出資料夾 / 重設 Key 計時 ----------
+    def on_open_out(self) -> None:
+        v = self.out_var.get().strip()
+        if not v:
+            messagebox.showinfo("尚未設定", "請先新增 PDF，或在「輸出資料夾」欄位選擇資料夾。")
+            return
+        p = Path(v).expanduser()
+        if not p.is_dir():
+            messagebox.showinfo("資料夾不存在", f"{p}\n\n開始翻譯後才會建立。")
+            return
+        open_path(p)
+
+    def _status_path(self) -> Path:
+        return Path(self.out_var.get().strip() or ".") / engine.KEY_STATUS_FILE
+
+    def on_reset_keys(self) -> None:
+        if not self.keys:
+            messagebox.showinfo("尚未設定 API Key", "目前沒有任何 Key。")
+            return
+        if not messagebox.askyesno(
+                "重設 Key 計時",
+                "這會清除所有 Key 的冷卻計時，讓它們立刻都可以再被使用。\n"
+                "（若 Google 那邊的額度其實還沒恢復，下一次請求會再被限流，該 Key 會重新冷卻。）\n\n確定要重設嗎？"):
+            return
+        try:
+            if self.km is not None:
+                self.km.reset_all()  # 執行中：同時清除記憶體與檔案，等待中的 Key 也會立刻解除
+            else:
+                engine.save_json(self._status_path(), {})
+        except Exception as e:
+            messagebox.showerror("重設失敗", str(e))
+            return
+        engine.log.info("已重設所有 Key 的冷卻計時。")
+        self._update_key_label()
+
+    def _worker(self, token, jobs, cfg, keys) -> None:
         log = engine.log
+        put = lambda *a: self.q.put(a)
         try:
             km = engine.KeyManager(keys, cfg.start_key - 1, cfg.timeout,
                                    str(Path(cfg.output_root) / engine.KEY_STATUS_FILE))
+            if token is self.run_token:
+                self.km = km
             log.info("模型 %s 啟動，共 %d 把 Key（從 %s 開始），%d 個 PDF", cfg.model, len(km.keys), km.label, len(jobs))
             for iid, path in jobs:
-                if engine.STOP.is_set():
+                if engine.STOP.is_set() or token is not self.run_token:
                     break
-                self.q.put(("book_start", iid))
+                put("book_start", token, iid)
                 job = engine.BookJob(path, cfg, km)
                 try:
                     status = job.run()
                 except engine.FatalError as e:
                     log.error("致命錯誤，中止：%s", e)
-                    self.q.put(("book_done", iid, "error"))
-                    self.q.put(("fatal", str(e)))
+                    put("book_done", token, iid, "error")
+                    put("fatal", token, str(e))
                     break
                 if job.tokens_in or job.tokens_out:
                     log.info("[%s] 本次 token 用量：in=%d out=%d", job.name, job.tokens_in, job.tokens_out)
-                self.q.put(("book_done", iid, status))
+                put("book_done", token, iid, status)
         except Exception as e:
             log.error("未預期的錯誤：%s: %s", type(e).__name__, e)
             log.debug("traceback", exc_info=True)
-            self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+            put("fatal", token, f"{type(e).__name__}: {e}")
         finally:
-            self.q.put(("finished",))
+            put("finished", token)
 
     # ---------- 重組 Markdown ----------
     def on_merge(self) -> None:
@@ -672,14 +1003,18 @@ class App:
                 kind = item[0]
                 if kind == "log":
                     self.append_log(item[1], item[2])
-                elif kind == "book_start":
-                    self._on_book_start(item[1])
+                    continue
+                if item[1] is not self.run_token:
+                    continue  # 已被「強制停止」作廢的舊工作事件，直接忽略
+                if kind == "book_start":
+                    self._on_book_start(item[2])
                 elif kind == "book_done":
-                    if item[1] in self.books:
-                        self.books[item[1]]["status"] = STATUS_TEXT.get(item[2], item[2])
+                    if item[2] in self.books:
+                        self.books[item[2]]["status"] = STATUS_TEXT.get(item[3], item[3])
                     self.refresh_stats(once=True)
                 elif kind == "fatal":
-                    messagebox.showerror("翻譯中止", item[1])
+                    if self.sched is None:  # 排程執行時不跳視窗，避免半夜卡在對話框
+                        messagebox.showerror("翻譯中止", item[2])
                 elif kind == "finished":
                     self._on_finished()
         except queue.Empty:
@@ -697,18 +1032,41 @@ class App:
 
     def _on_finished(self) -> None:
         stopped = engine.STOP.is_set()
+        by_schedule = self._end_signaled
+        sched = self.sched
+        now = time.time()
+        self.running = False
+        self.run_token = None
         self.cur = None
-        if self.file_handler is not None:
-            engine.log.removeHandler(self.file_handler)
-            self.file_handler.close()
-            self.file_handler = None
+        self.km = None
+        self.end_ts = None
+        self._end_signaled = False
+        self._detach_file_handler()
         for b in self.books.values():
             if b["status"] in ("排隊中", "翻譯中"):
                 b["status"] = "已停止"
-        self._set_running_ui(False)
+
+        # 排程「每天重複」：是到了結束時間才停的，就等下一個開始時間再繼續
+        if by_schedule and sched and sched.get("daily") and sched.get("start_ts") and self.pending:
+            nxt = sched["start_ts"] + 86400
+            while nxt <= now:
+                nxt += 86400
+            sched["start_ts"] = nxt
+            self.waiting = True
+            self.refresh_stats(once=True)
+            engine.log.info("本輪排程結束，下次將於 %s 開始。", self._fmt_ts(nxt))
+            return
+
+        self.waiting = False
+        self.sched = None
+        self.pending = None
+        self._set_busy_ui(False)
         self.refresh_stats(once=True)
-        self.status_var.set("已停止" if stopped else "全部處理完畢")
-        if not stopped:
+        if by_schedule:
+            self.status_var.set("已到排程結束時間，已停止")
+        else:
+            self.status_var.set("已停止" if stopped else "全部處理完畢")
+        if not stopped and sched is None:
             lines = [f"{b['name']}：{b['status']}（{b['done']}/{b['total'] or '?'} 頁，失敗 {b['failed']}）"
                      for b in self.books.values()]
             messagebox.showinfo("翻譯結束", "\n".join(lines) +
@@ -775,12 +1133,15 @@ class App:
 
     # ---------- 關閉 ----------
     def on_close(self) -> None:
-        if self.running:
-            if not messagebox.askyesno("翻譯進行中", "目前仍在翻譯。確定要結束嗎？\n（已完成的頁面都已存檔，下次可續傳）"):
+        if self.running or self.waiting:
+            msg = ("目前仍在翻譯。確定要結束嗎？\n（已完成的頁面都已存檔，下次可續傳）" if self.running
+                   else "目前有排程等待中，結束程式會取消排程。確定要結束嗎？")
+            if not messagebox.askyesno("確定要結束？", msg):
                 return
-            engine.STOP.set()
+            engine.abort_all()
         self.save_settings()
         self.root.destroy()
+
 
 
 def main() -> None:

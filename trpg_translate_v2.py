@@ -63,6 +63,13 @@ except ImportError:
 
 log = logging.getLogger("trpg")
 STOP = threading.Event()
+RUN_GEN = [0]  # 每次「強制停止」加 1；舊世代的背景執行緒偵測到不一致就會自行退出，且不再寫入任何結果
+
+
+def abort_all() -> None:
+    """強制停止：作廢所有進行中的工作（背景正在等待回應的請求結果會被丟棄）。"""
+    RUN_GEN[0] += 1
+    STOP.set()
 
 INLINE_LIMIT = 15 * 1024 * 1024  # 單頁 PDF 超過此大小才改走 Files API
 BAD_KEY_COOLDOWN = 3600          # 401/403/無效金鑰：冷卻 1 小時
@@ -241,6 +248,7 @@ def next_daily_reset_ts() -> float:
 class KeyManager:
     def __init__(self, keys: List[str], start_index: int, timeout_sec: int,
                  status_path: str = KEY_STATUS_FILE):
+        self.gen = RUN_GEN[0]
         seen, uniq = set(), []
         for k in keys:
             if k not in seen:
@@ -301,7 +309,7 @@ class KeyManager:
         """切到下一把可用的 Key（優先其他 Key，最後才是目前這把）。
         全部冷卻中就顯示倒數等待。被 Ctrl+C 中止回傳 False。"""
         n = len(self.keys)
-        while not STOP.is_set():
+        while not STOP.is_set() and self.gen == RUN_GEN[0]:
             now = time.time()
             for i in range(1, n + 1):
                 cand = (self.index + i) % n
@@ -316,13 +324,23 @@ class KeyManager:
         soonest = min(range(len(self.keys)), key=self._until)
         resume = datetime.datetime.fromtimestamp(target).strftime("%m/%d %H:%M:%S")
         log.warning("⏳ %d 把 Key 全部冷卻中，最快 %s 恢復（Key #%d）", len(self.keys), resume, soonest + 1)
-        while not STOP.is_set() and time.time() < target:
+        while not STOP.is_set() and self.gen == RUN_GEN[0] and time.time() < target:
+            # 每秒重新計算：使用者按「重設 Key 計時」後，等待會立刻結束
+            target = min(self._until(i) for i in range(len(self.keys)))
+            if time.time() >= target:
+                break
             remaining = int(target - time.time()) + 1
             h, r = divmod(max(remaining, 0), 3600)
             m, s = divmod(r, 60)
             print(f"\r💤 倒數 [{h:02d}:{m:02d}:{s:02d}]（Ctrl+C 可中止）", end="", flush=True)
             interruptible_sleep(1)
         print("\r" + " " * 50 + "\r", end="", flush=True)
+
+    def reset_all(self) -> None:
+        """清除所有 Key 的冷卻計時（手動重設）。"""
+        for kid in list(self.until):
+            self.until[kid] = 0.0
+        self._save()
 
     def wait_turn(self, min_interval: float) -> None:
         wait = self._last_req + min_interval - time.monotonic()
@@ -445,7 +463,12 @@ def merge_pages(pages_dir: Path, failed_path: Path, out_path: Path,
 # 單本書的翻譯流程
 # ============================================================
 class BookJob:
+    def alive(self) -> bool:
+        """False 代表這個工作已被「強制停止」作廢，不應再寫入任何東西。"""
+        return self.gen == RUN_GEN[0]
+
     def __init__(self, pdf_path: Path, cfg: Config, km: KeyManager):
+        self.gen = RUN_GEN[0]
         self.pdf_path = pdf_path
         self.cfg = cfg
         self.km = km
@@ -701,10 +724,10 @@ class BookJob:
         fails = rate_hits = 0
         last_err = ""
         while True:
-            if STOP.is_set():
+            if STOP.is_set() or not self.alive():
                 return "stopped"
             km.wait_turn(cfg.min_interval)
-            if STOP.is_set():
+            if STOP.is_set() or not self.alive():
                 return "stopped"
             t0 = time.time()
             try:
@@ -744,6 +767,8 @@ class BookJob:
                 log.warning("⚠️ 第 %d 頁發生錯誤 (%s)，第 %d/%d 次", n, last_err, fails, cfg.max_fails)
                 log.debug("traceback", exc_info=True)
             else:
+                if not self.alive():  # 強制停止後才回來的結果：直接丟棄
+                    return "stopped"
                 self.commit_page(n, result, usage)
                 log.info("✅ 第 %d 頁完成（總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, time.time() - t0,
                          self.last_upload_s, self.last_gen_s,
@@ -787,7 +812,7 @@ class BookJob:
         aborted = False
         try:
             for n in range(start, end + 1):
-                if STOP.is_set():
+                if STOP.is_set() or not self.alive():
                     break
                 if self.page_path(n).exists():
                     continue
@@ -805,11 +830,12 @@ class BookJob:
                 else:
                     break
         finally:
-            count = self.merge()
-            log.info("📝 已合併 %d 頁 → %s", count, self.output_md)
+            if self.alive():
+                count = self.merge()
+                log.info("📝 已合併 %d 頁 → %s", count, self.output_md)
 
         all_done = all(self.page_path(i).exists() for i in range(1, self.total + 1))
-        if STOP.is_set():
+        if STOP.is_set() or not self.alive():
             return "stopped"
         if all_done:
             log.info("🎉 [%s] 全文翻譯完成！", self.name)
