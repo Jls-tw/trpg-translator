@@ -1,0 +1,11 @@
+# 絕對不要上傳這些：含 API Key、個人路徑或大型檔案
+.env
+gui_settings.json
+api_key_status.json
+translator.log
+*.pdf
+*.json.tmp
+__pycache__/
+dist/
+build/
+*.spec
