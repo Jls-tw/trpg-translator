@@ -65,11 +65,17 @@ except Exception:
     TRAY_AVAILABLE = False
 
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
+APP_VERSION = getattr(engine, "__version__", "2.6.0")
 DEFAULT_FALLBACKS = "gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite"
 DARK = {  # 深色模式配色
     "bg": "#1f1f23", "fg": "#e8e8ea", "field": "#2b2b31", "btn": "#38383f", "hover": "#45454d",
     "border": "#4a4a52", "sel": "#2f5d8a", "dis": "#7a7a82", "hint": "#a0a0a8", "accent": "#3b82f6",
     "warn": "#fbbf24", "err": "#f87171",
+}
+LIGHT = {  # 淺色模式配色（與深色共用同一個 ttk 主題，元件尺寸一致，切換時版面不會跳動）
+    "bg": "#f0f0f0", "fg": "#1a1a1a", "field": "#ffffff", "btn": "#e4e4e4", "hover": "#d6d6d6",
+    "border": "#b5b5b5", "sel": "#0078d7", "dis": "#8c8c8c", "hint": "#666666", "accent": "#0078d7",
+    "warn": "#b45309", "err": "#b91c1c",
 }
 LIST_H0, LOG_H0 = 150, 190   # PDF 清單 / 執行記錄 的初始高度（像素）
 LIST_MIN, LOG_MIN = 90, 80   # 兩者可縮到的最小高度
@@ -166,6 +172,60 @@ def count_failed(failed_path: Path) -> int:
         return 0
 
 
+class Tooltip:
+    """滑鼠停留一下才顯示的提示。使用獨立的小視窗，完全不佔用版面。
+    text 可以是字串，或「回傳字串的函式」（內容會隨狀態變化）；colors 為回傳 {'bg','fg'} 的函式。"""
+
+    def __init__(self, widget, text, colors=None, delay: int = 450):
+        self.widget, self.text, self.colors, self.delay = widget, text, colors, delay
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, event=None) -> None:
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self) -> None:
+        self._after = None
+        if self._tip is not None:
+            return
+        text = self.text() if callable(self.text) else self.text
+        if not text:
+            return
+        c = (self.colors() if callable(self.colors) else None) or {"bg": "#ffffe1", "fg": "#000000"}
+        x, y = self.widget.winfo_pointerx() + 14, self.widget.winfo_pointery() + 18
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        try:
+            tip.attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(tip, text=text, justify="left", background=c["bg"], foreground=c["fg"], relief="solid",
+                 borderwidth=1, wraplength=400, padx=8, pady=5).pack()
+        self._tip = tip
+
+    def _hide(self, event=None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
 class QueueLogHandler(logging.Handler):
     """把引擎的 log 轉送到 GUI 的佇列（執行緒安全）。"""
 
@@ -187,7 +247,7 @@ class QueueLogHandler(logging.Handler):
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("TRPG 規則書翻譯工具")
+        root.title(f"TRPG_Translator [{APP_VERSION}]")
         root.geometry("1020x860")
         root.minsize(920, 560)
         self._drag = None
@@ -206,11 +266,15 @@ class App:
         self.file_handler: Optional[logging.Handler] = None
         self.tray_icon = None
         self.grips: List[tk.Widget] = []
+        self._idle_windows = 0       # 連續幾個排程時段沒有任何進展
+        self._window_done0 = 0       # 本時段開始時的已完成頁數
+        self._had_fatal = False
         self.keys: List[str] = parse_keys(os.environ.get("GEMINI_API_KEYS", ""))
 
         self._setup_style()
         self._init_vars()
         self._build_ui()
+        self._add_tooltips()
         self._setup_logging()
         self.load_settings()
         self._apply_theme()
@@ -237,10 +301,7 @@ class App:
         ui_family = family or ("PingFang TC" if sys.platform == "darwin" else "TkDefaultFont")
         self._ui_family = ui_family
         self.log_font = (ui_family, 9)
-        self.style = ttk.Style()
-        self._native_theme = self.style.theme_use()
-        self._default_bg = self.root.cget("bg")
-        self._configure_custom_styles(dark=False)
+        self.style = ttk.Style()  # 實際外觀由 _apply_theme 設定（淺色與深色共用同一個主題）
 
     # ---------- 變數 ----------
     def _init_vars(self) -> None:
@@ -271,7 +332,6 @@ class App:
         self.sched_end_on = tk.BooleanVar(value=False)
         self.sched_end_h = tk.StringVar(value="06")
         self.sched_end_m = tk.StringVar(value="00")
-        self.sched_daily = tk.BooleanVar(value=False)
         self.sched_text = tk.StringVar(value="")
         # 自動切換模型
         self.auto_var = tk.BooleanVar(value=False)
@@ -328,9 +388,6 @@ class App:
         for b in self.list_buttons:
             b.pack(fill="x", pady=2)
         ttk.Button(btns, text="開啟譯文 / 資料夾", command=self.on_open_result).pack(fill="x", pady=(14, 2))
-        ttk.Label(box, text="未選取任何項目時，會處理清單中的全部 PDF；雙擊可開啟譯文。"
-                            "拖曳各框下方的橫條，可分別調整清單與執行記錄的高度。",
-                  style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # --- ②③④⑤ 設定 ---
         mid = ttk.Frame(root)
@@ -350,7 +407,8 @@ class App:
             self.settings_widgets.append(widget)
 
         model_values = [engine.Config.model] + [m for m in MODEL_CHOICES if m != engine.Config.model]
-        add_row(0, 0, "模型", ttk.Combobox(sf, textvariable=self.model_var, width=24, values=model_values))
+        self.model_combo = ttk.Combobox(sf, textvariable=self.model_var, width=24, values=model_values)
+        add_row(0, 0, "模型", self.model_combo)
         add_row(0, 2, "思考強度", ttk.Combobox(sf, textvariable=self.thinking_var, width=10,
                                               values=THINKING_CHOICES, state="readonly"))
         add_row(1, 0, "單次逾時（秒）", ttk.Spinbox(sf, from_=10, to=900, increment=10, textvariable=self.timeout_var, width=8))
@@ -360,11 +418,9 @@ class App:
         add_row(3, 0, "起始 Key 編號", ttk.Spinbox(sf, from_=1, to=99, textvariable=self.startkey_var, width=8))
         add_row(3, 2, "PDF 傳送方式", ttk.Combobox(sf, textvariable=self.transport_var, width=10,
                                                   values=["files", "inline"], state="readonly"))
-        ttk.Label(sf, text="免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。也可直接輸入其他型號名稱。",
-                  style="Hint.TLabel", wraplength=560, justify="left").grid(
-            row=4, column=0, columnspan=4, sticky="w", pady=(2, 4))
         auto_cb = ttk.Checkbutton(sf, text="伺服器塞車或額度用完時，自動切換到備援模型", variable=self.auto_var)
         auto_cb.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 1))
+        self.auto_cb = auto_cb
         self.settings_widgets.append(auto_cb)
         ttk.Label(sf, text="備援模型（依序）").grid(row=6, column=0, sticky="e", padx=(0, 6), pady=3)
         fb = ttk.Entry(sf, textvariable=self.fallback_var)
@@ -406,11 +462,10 @@ class App:
         self.out_browse = ttk.Button(of, text="瀏覽…", width=7, command=self.on_browse_out)
         self.out_browse.grid(row=0, column=1, padx=(6, 0))
         ttk.Button(of, text="開啟資料夾", width=10, command=self.on_open_out).grid(row=0, column=2, padx=(6, 0))
-        ttk.Label(of, text="譯文與進度會存在此資料夾下的「書名」子資料夾。",
-                  style="Hint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         sc = ttk.LabelFrame(right, text=" ⑤ 排程（選用） ", padding=8)
         sc.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.sched_widgets: List[tk.Widget] = []
         for r, (on_var, text, hv, mv) in enumerate((
             (self.sched_start_on, "開始時間", self.sched_start_h, self.sched_start_m),
             (self.sched_end_on, "結束時間", self.sched_end_h, self.sched_end_m),
@@ -423,11 +478,7 @@ class App:
             ttk.Label(sc, text=":").grid(row=r, column=2, padx=2)
             ms.grid(row=r, column=3)
             self.settings_widgets += [cb, hs, ms]
-        dc = ttk.Checkbutton(sc, text="每天重複（需同時勾選開始與結束）", variable=self.sched_daily)
-        dc.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
-        self.settings_widgets.append(dc)
-        ttk.Label(sc, textvariable=self.sched_text, style="Hint.TLabel", wraplength=330,
-                  justify="left").grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            self.sched_widgets += [cb, hs, ms]
 
         # --- 操作列 ---
         bar = ttk.Frame(root)
@@ -476,7 +527,7 @@ class App:
         self.tray_cb.grid(row=0, column=1, padx=(10, 6))
         if sys.platform == "darwin":  # macOS 不支援縮到系統匣，請用 Dock 縮小視窗
             self.tray_cb.grid_remove()
-        self.theme_btn = ttk.Button(foot, text="深色模式", command=self.on_toggle_theme)
+        self.theme_btn = ttk.Button(foot, text="☾", width=3, style="Icon.TButton", command=self.on_toggle_theme)
         self.theme_btn.grid(row=0, column=2, padx=(0, 6), pady=2)
 
     def _init_layout(self) -> None:
@@ -549,7 +600,7 @@ class App:
         for k, var in (("prev", self.prev_var), ("join", self.join_var),
                        ("markers", self.markers_var), ("move", self.move_var),
                        ("sched_start_on", self.sched_start_on), ("sched_end_on", self.sched_end_on),
-                       ("sched_daily", self.sched_daily), ("auto", self.auto_var),
+                       ("auto", self.auto_var),
                        ("dark", self.dark_var), ("tray", self.tray_var)):
             if k in data:
                 var.set(bool(data[k]))
@@ -568,7 +619,6 @@ class App:
             "sched_start_on": self.sched_start_on.get(), "sched_start_h": self.sched_start_h.get(),
             "sched_start_m": self.sched_start_m.get(), "sched_end_on": self.sched_end_on.get(),
             "sched_end_h": self.sched_end_h.get(), "sched_end_m": self.sched_end_m.get(),
-            "sched_daily": self.sched_daily.get(),
             "auto": self.auto_var.get(), "fallback": self.fallback_var.get(),
             "congest": self.congest_var.get(), "recover": self.recover_var.get(),
             "dark": self.dark_var.get(), "tray": self.tray_var.get(),
@@ -709,71 +759,66 @@ class App:
 
     # ---------- 深色模式 ----------
     def _configure_custom_styles(self, dark: bool) -> None:
+        c = DARK if dark else LIGHT
         style = self.style
         style.configure("Treeview", rowheight=26)
         style.configure("Start.TButton", font=(self._ui_family, 11, "bold"), padding=(14, 6))
-        style.configure("Hint.TLabel", foreground=DARK["hint"] if dark else "#666666")
-        style.configure("Danger.TButton", foreground=DARK["err"] if dark else "#b91c1c")
+        style.configure("Icon.TButton", font=(self._ui_family, 12), padding=(2, 0))
+        style.configure("Hint.TLabel", foreground=c["hint"])
+        style.configure("Danger.TButton", foreground=c["err"])
 
     def _apply_theme(self) -> None:
         dark = bool(self.dark_var.get())
+        c = DARK if dark else LIGHT
         style, root = self.style, self.root
-        if dark:
-            c = DARK
-            style.theme_use("clam")
-            style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
-                            bordercolor=c["border"], lightcolor=c["bg"], darkcolor=c["bg"],
-                            troughcolor=c["field"], insertcolor=c["fg"],
+        # 淺色與深色使用「同一個」主題（clam）：所有元件的尺寸、邊距完全相同，只換顏色，
+        # 所以切換時版面不會位移。
+        style.theme_use("clam")
+        style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
+                        bordercolor=c["border"], lightcolor=c["bg"], darkcolor=c["bg"],
+                        troughcolor=c["field"], insertcolor=c["fg"],
+                        selectbackground=c["sel"], selectforeground="#ffffff")
+        style.map(".", foreground=[("disabled", c["dis"])])
+        style.configure("TButton", background=c["btn"], foreground=c["fg"], bordercolor=c["border"],
+                        focuscolor=c["btn"], padding=(8, 3))
+        style.map("TButton", background=[("active", c["hover"]), ("disabled", c["bg"])],
+                  foreground=[("disabled", c["dis"])])
+        style.configure("TEntry", fieldbackground=c["field"], foreground=c["fg"], insertcolor=c["fg"])
+        style.map("TEntry", fieldbackground=[("disabled", c["bg"])], foreground=[("disabled", c["dis"])])
+        for w in ("TCombobox", "TSpinbox"):
+            style.configure(w, fieldbackground=c["field"], background=c["btn"], foreground=c["fg"],
+                            arrowcolor=c["fg"], insertcolor=c["fg"],
                             selectbackground=c["sel"], selectforeground="#ffffff")
-            style.map(".", foreground=[("disabled", c["dis"])])
-            style.configure("TButton", background=c["btn"], foreground=c["fg"], bordercolor=c["border"],
-                            focuscolor=c["btn"])
-            style.map("TButton", background=[("active", c["hover"]), ("disabled", c["bg"])],
-                      foreground=[("disabled", c["dis"])])
-            style.configure("TEntry", fieldbackground=c["field"], foreground=c["fg"], insertcolor=c["fg"])
-            style.map("TEntry", fieldbackground=[("disabled", c["bg"])], foreground=[("disabled", c["dis"])])
-            for w in ("TCombobox", "TSpinbox"):
-                style.configure(w, fieldbackground=c["field"], background=c["btn"], foreground=c["fg"],
-                                arrowcolor=c["fg"], insertcolor=c["fg"],
-                                selectbackground=c["sel"], selectforeground="#ffffff")
-                style.map(w, fieldbackground=[("readonly", c["field"]), ("disabled", c["bg"])],
-                          foreground=[("disabled", c["dis"])], arrowcolor=[("disabled", c["dis"])])
-            style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
-                            indicatorbackground=c["field"], indicatorforeground=c["fg"],
-                            upperbordercolor=c["border"], lowerbordercolor=c["border"])
-            style.map("TCheckbutton", background=[("active", c["bg"])],
-                      indicatorbackground=[("selected", c["accent"]), ("disabled", c["bg"])])
-            style.configure("TLabelframe", background=c["bg"], bordercolor=c["border"])
-            style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
-            style.configure("Treeview", background=c["field"], fieldbackground=c["field"],
-                            foreground=c["fg"], bordercolor=c["border"])
-            style.map("Treeview", background=[("selected", c["sel"])], foreground=[("selected", "#ffffff")])
-            style.configure("Treeview.Heading", background=c["btn"], foreground=c["fg"], bordercolor=c["border"])
-            style.map("Treeview.Heading", background=[("active", c["hover"])])
-            style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"], bordercolor=c["border"])
-            style.configure("Vertical.TScrollbar", background=c["btn"], troughcolor=c["field"],
-                            arrowcolor=c["fg"], bordercolor=c["border"])
-            style.map("Vertical.TScrollbar", background=[("active", c["hover"])])
-            root.option_add("*TCombobox*Listbox.background", c["field"])
-            root.option_add("*TCombobox*Listbox.foreground", c["fg"])
-            root.option_add("*TCombobox*Listbox.selectBackground", c["sel"])
-            root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-            bg, fg, field, warn, err, grip = c["bg"], c["fg"], c["field"], c["warn"], c["err"], c["border"]
-        else:
-            style.theme_use(self._native_theme)
-            root.option_add("*TCombobox*Listbox.background", "#ffffff")
-            root.option_add("*TCombobox*Listbox.foreground", "#000000")
-            root.option_add("*TCombobox*Listbox.selectBackground", "#0078d7")
-            root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-            bg, fg, field, warn, err, grip = self._default_bg, "#000000", "#ffffff", "#b45309", "#b91c1c", self._default_bg
+            style.map(w, fieldbackground=[("readonly", c["field"]), ("disabled", c["bg"])],
+                      foreground=[("disabled", c["dis"])], arrowcolor=[("disabled", c["dis"])])
+        style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
+                        indicatorbackground=c["field"], indicatorforeground=c["fg"],
+                        upperbordercolor=c["border"], lowerbordercolor=c["border"])
+        style.map("TCheckbutton", background=[("active", c["bg"])],
+                  indicatorbackground=[("selected", c["accent"]), ("disabled", c["bg"])])
+        style.configure("TLabelframe", background=c["bg"], bordercolor=c["border"])
+        style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+        style.configure("Treeview", background=c["field"], fieldbackground=c["field"],
+                        foreground=c["fg"], bordercolor=c["border"])
+        style.map("Treeview", background=[("selected", c["sel"])], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=c["btn"], foreground=c["fg"], bordercolor=c["border"])
+        style.map("Treeview.Heading", background=[("active", c["hover"])])
+        style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"], bordercolor=c["border"])
+        style.configure("Vertical.TScrollbar", background=c["btn"], troughcolor=c["field"],
+                        arrowcolor=c["fg"], bordercolor=c["border"])
+        style.map("Vertical.TScrollbar", background=[("active", c["hover"])])
+        root.option_add("*TCombobox*Listbox.background", c["field"])
+        root.option_add("*TCombobox*Listbox.foreground", c["fg"])
+        root.option_add("*TCombobox*Listbox.selectBackground", c["sel"])
+        root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
         self._configure_custom_styles(dark)
-        root.configure(bg=bg)
-        self.log_text.configure(bg=field, fg=fg, insertbackground=fg)
-        self.log_text.tag_configure("warn", foreground=warn)
-        self.log_text.tag_configure("error", foreground=err)
+        root.configure(bg=c["bg"])
+        self.log_text.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
+        self.log_text.tag_configure("warn", foreground=c["warn"])
+        self.log_text.tag_configure("error", foreground=c["err"])
         for gw in self.grips:
-            gw.configure(bg=grip)
-        self.theme_btn.configure(text="淺色模式" if dark else "深色模式")
+            gw.configure(bg=c["bg"])
+        self.theme_btn.configure(text="☀" if dark else "☾")  # 深色模式顯示太陽（點了切回淺色），淺色顯示月亮
         self._set_titlebar_dark(dark)
 
     def _set_titlebar_dark(self, dark: bool) -> None:
@@ -797,9 +842,9 @@ class App:
         self.save_settings()
 
     def _style_dialog(self, win, txt) -> None:
-        if self.dark_var.get():
-            win.configure(bg=DARK["bg"])
-            txt.configure(bg=DARK["field"], fg=DARK["fg"], insertbackground=DARK["fg"])
+        c = DARK if self.dark_var.get() else LIGHT
+        win.configure(bg=c["bg"])
+        txt.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
 
     # ---------- 縮到系統匣 ----------
     def _on_tray_toggle(self) -> None:
@@ -877,6 +922,73 @@ class App:
             self.tray_icon.title = ("TRPG 翻譯：" + t)[:120]
         except Exception:
             pass
+
+    # ---------- 失敗頁碼摘要 ----------
+    @staticmethod
+    def _fmt_pages(pages) -> str:
+        """[3,4,5,9] -> '3–5, 9'"""
+        pages = sorted(set(int(x) for x in pages))
+        out, i = [], 0
+        while i < len(pages):
+            j = i
+            while j + 1 < len(pages) and pages[j + 1] == pages[j] + 1:
+                j += 1
+            out.append(str(pages[i]) if i == j else f"{pages[i]}–{pages[j]}")
+            i = j + 1
+        return ", ".join(out)
+
+    def _log_failed_summary(self, iids) -> None:
+        for iid in iids:
+            b = self.books.get(iid)
+            if not b:
+                continue
+            folder = self.out_root(b["path"]) / b["name"]
+            data = engine.load_json(folder / "failed_pages.json", {})
+            pages = [int(k) for k in data.get("pages", {}) if str(k).isdigit()]
+            if pages:
+                engine.log.warning("[%s] 失敗的頁碼：%s（共 %d 頁）。再按一次「開始翻譯」會自動重試這些頁。",
+                                   b["name"], self._fmt_pages(pages), len(pages))
+            else:
+                engine.log.info("[%s] 沒有失敗的頁面。", b["name"])
+
+    def _sum_done(self, iids) -> int:
+        return sum(self.books[i]["done"] for i in iids if i in self.books)
+
+    def _target_done(self, iid: str, cfg) -> bool:
+        """這次要翻的範圍（起訖頁）是否已全部完成。"""
+        b = self.books.get(iid)
+        if not b or not b.get("total"):
+            return False
+        total = b["total"]
+        lo = max(1, cfg.start)
+        hi = cfg.end if 0 < cfg.end <= total else total
+        pages = Path(cfg.output_root) / b["name"] / "pages"
+        return all((pages / f"{i:04d}.json").exists() for i in range(lo, hi + 1))
+
+    # ---------- 滑鼠懸停提示 ----------
+    def _tip_colors(self) -> dict:
+        return {"bg": DARK["field"], "fg": DARK["fg"]} if self.dark_var.get() else {"bg": "#ffffe1", "fg": "#000000"}
+
+    def _sched_tip_text(self) -> str:
+        base = ("設定「開始」與「結束」時間後，會每天在這個時段自動重複，直到全部翻完；按「停止」可取消排程。\n"
+                "只設開始時間：到時開始，做完為止。\n只設結束時間：現在開始，到時停止。\n"
+                "電腦需保持開機且不要睡眠。")
+        cur = self.sched_text.get()
+        return base + (("\n\n" + cur) if cur else "")
+
+    def _add_tooltips(self) -> None:
+        tip = lambda w, text: Tooltip(w, text, self._tip_colors)
+        tip(self.tree, "未選取任何項目時，會處理清單中的全部 PDF；雙擊可開啟譯文。\n"
+                       "拖曳各框下方的橫條，可分別調整清單與執行記錄的高度。")
+        tip(self.model_combo, "免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。\n"
+                              "也可直接輸入其他型號名稱。")
+        tip(self.auto_cb, "同一模型連續出現 503 / 504 / 逾時就判定塞車，改用備援模型；額度用完時也會切換。")
+        tip(self.out_entry, "譯文與進度會存在此資料夾下的「書名」子資料夾。")
+        for w in self.sched_widgets:
+            Tooltip(w, self._sched_tip_text, self._tip_colors)
+        tip(self.tray_cb, "按「縮小」時收進右下角通知區域，翻譯與排程仍會繼續；點兩下圖示可還原。")
+        Tooltip(self.theme_btn, lambda: "切換為淺色模式" if self.dark_var.get() else "切換為深色模式",
+                self._tip_colors)
 
     # ---------- 設定驗證 ----------
     @staticmethod
@@ -992,6 +1104,9 @@ class App:
         if sched and sched.get("end"):
             self.end_ts = self._next_occurrence(sched["end"][0], sched["end"][1], time.time())
         self._end_signaled = False
+        self._had_fatal = False
+        self.refresh_stats(once=True)
+        self._window_done0 = self._sum_done(p["targets"])
 
         self._detach_file_handler()
         self.file_handler = logging.FileHandler(Path(p["out"]) / "translator.log", encoding="utf-8")
@@ -1039,11 +1154,13 @@ class App:
                 "已完成的頁面都已存檔，不受影響，下次可續傳。\n\n確定要強制停止嗎？"):
             return
         engine.abort_all()
+        targets = list(self.pending["targets"]) if self.pending else []
         self.run_token = None
         self.running = False
         self.waiting = False
         self.sched = None
         self.pending = None
+        self._idle_windows = 0
         self.end_ts = None
         self._end_signaled = False
         self.cur = None
@@ -1055,6 +1172,7 @@ class App:
         self._set_busy_ui(False)
         self.refresh_stats(once=True)
         engine.log.warning("已強制停止。背景中尚未回應的請求會被丟棄。")
+        self._log_failed_summary(targets)
         self.status_var.set("已強制停止")
 
     def _cancel_waiting(self, msg: str) -> None:
@@ -1093,10 +1211,8 @@ class App:
             return (self._num(hv, f"{label}（時）", 0, 23), self._num(mv, f"{label}（分）", 0, 59))
         start = hm(self.sched_start_on, self.sched_start_h, self.sched_start_m, "開始時間")
         end = hm(self.sched_end_on, self.sched_end_h, self.sched_end_m, "結束時間")
-        daily = bool(self.sched_daily.get())
-        if daily and not (start and end):
-            raise ValueError("「每天重複」需要同時勾選「開始時間」與「結束時間」。")
-        return {"start": start, "end": end, "daily": daily}
+        # 同時設定開始與結束時間 = 每天固定時段自動重複，直到全部翻完（按「停止」可取消）
+        return {"start": start, "end": end, "daily": bool(start and end)}
 
     def _sched_tick(self) -> None:
         """每秒檢查：到開始時間就啟動；到結束時間就安全停止。"""
@@ -1145,7 +1261,7 @@ class App:
                 parts.append("立即開始")
             if sc["end"]:
                 parts.append(f"{self._fmt_ts(self._next_occurrence(sc['end'][0], sc['end'][1], base))} 停止")
-            self.sched_text.set("預計：" + "，".join(parts) + ("（每天重複）" if sc["daily"] else ""))
+            self.sched_text.set("預計：" + "，".join(parts) + ("（每天自動重複）" if sc["daily"] else ""))
 
     # ---------- 開啟輸出資料夾 ----------
     def on_open_out(self) -> None:
@@ -1235,6 +1351,7 @@ class App:
                         self.books[item[2]]["status"] = STATUS_TEXT.get(item[3], item[3])
                     self.refresh_stats(once=True)
                 elif kind == "fatal":
+                    self._had_fatal = True
                     if self.sched is None:  # 排程執行時不跳視窗，避免半夜卡在對話框
                         messagebox.showerror("翻譯中止", item[2])
                 elif kind == "finished":
@@ -1256,6 +1373,8 @@ class App:
         stopped = engine.STOP.is_set()
         by_schedule = self._end_signaled
         sched = self.sched
+        pending = self.pending
+        had_fatal = self._had_fatal
         now = time.time()
         self.running = False
         self.run_token = None
@@ -1267,23 +1386,36 @@ class App:
         for b in self.books.values():
             if b["status"] in ("排隊中", "翻譯中"):
                 b["status"] = "已停止"
+        self.refresh_stats(once=True)
+        targets = pending["targets"] if pending else []
+        self._log_failed_summary(targets)  # 每次停止都列出失敗的頁碼
 
-        # 排程「每天重複」：是到了結束時間才停的，就等下一個開始時間再繼續
-        if by_schedule and sched and sched.get("daily") and sched.get("start_ts") and self.pending:
-            nxt = sched["start_ts"] + 86400
-            while nxt <= now:
-                nxt += 86400
-            sched["start_ts"] = nxt
-            self.waiting = True
-            self.refresh_stats(once=True)
-            engine.log.info("本輪排程結束，下次將於 %s 開始。", self._fmt_ts(nxt))
-            return
+        # 排程（同時設定開始與結束）：每天自動重複，直到全部翻完；使用者按「停止」會清掉 self.sched
+        if sched and sched.get("daily") and sched.get("start_ts") and pending and not had_fatal:
+            cfg = pending["cfg"]
+            if all(self._target_done(iid, cfg) for iid in targets):
+                pass  # 全部翻完了，往下走一般的結束流程
+            else:
+                if self._sum_done(targets) <= self._window_done0:
+                    self._idle_windows += 1
+                else:
+                    self._idle_windows = 0
+                if self._idle_windows >= 3:
+                    engine.log.warning("連續 3 個排程時段都沒有任何進展，已取消每日自動重複（避免白白消耗額度）。")
+                else:
+                    nxt = sched["start_ts"] + 86400
+                    while nxt <= now:
+                        nxt += 86400
+                    sched["start_ts"] = nxt
+                    self.waiting = True
+                    engine.log.info("本輪排程時段結束（尚有頁面未完成），下次將於 %s 自動開始。", self._fmt_ts(nxt))
+                    return
 
+        self._idle_windows = 0
         self.waiting = False
         self.sched = None
         self.pending = None
         self._set_busy_ui(False)
-        self.refresh_stats(once=True)
         if by_schedule:
             self.status_var.set("已到排程結束時間，已停止")
         else:

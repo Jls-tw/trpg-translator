@@ -25,6 +25,8 @@ TRPG 規則書 PDF 逐頁翻譯工具 v2
 """
 from __future__ import annotations
 
+__version__ = "2.6.0"
+
 import argparse
 import datetime
 import glob
@@ -1028,6 +1030,7 @@ def _sigint(sig, frame):
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TRPG 規則書 PDF 逐頁翻譯工具 v2")
+    p.add_argument("--version", action="version", version=f"TRPG_Translator {__version__}")
     p.add_argument("--pdf", nargs="*", help="指定 PDF 檔（可用萬用字元）；預設為目前資料夾所有 *.pdf")
     p.add_argument("--start", type=int, default=1, help="起始頁（需搭配單一 PDF）")
     p.add_argument("--end", type=int, default=0, help="結束頁，0 = 到最後一頁（需搭配單一 PDF）")
