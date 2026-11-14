@@ -56,7 +56,21 @@ except Exception as _e:  # 缺檔或缺套件時給出看得懂的訊息
     )
     sys.exit(1)
 
+try:  # 系統匣功能（選用）：pip install pystray pillow；macOS 不支援
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = sys.platform != "darwin"
+except Exception:
+    pystray = None
+    TRAY_AVAILABLE = False
+
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
+DEFAULT_FALLBACKS = "gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite"
+DARK = {  # 深色模式配色
+    "bg": "#1f1f23", "fg": "#e8e8ea", "field": "#2b2b31", "btn": "#38383f", "hover": "#45454d",
+    "border": "#4a4a52", "sel": "#2f5d8a", "dis": "#7a7a82", "hint": "#a0a0a8", "accent": "#3b82f6",
+    "warn": "#fbbf24", "err": "#f87171",
+}
 LIST_H0, LOG_H0 = 150, 190   # PDF 清單 / 執行記錄 的初始高度（像素）
 LIST_MIN, LOG_MIN = 90, 80   # 兩者可縮到的最小高度
 ENV_FILE = APP_DIR / ".env"
@@ -183,13 +197,15 @@ class App:
         self.running = False          # 背景工作執行緒正在翻譯
         self.waiting = False          # 排程：等待開始時間中
         self.run_token = None         # 這一輪工作的識別物件（強制停止後，舊工作的事件會被忽略）
-        self.km = None                # 目前工作使用的 KeyManager（「重設 Key 計時」用）
+        self.km = None                # 目前工作使用的 KeyManager
         self.sched: Optional[dict] = None
         self.pending: Optional[dict] = None
         self.end_ts: Optional[float] = None
         self._end_signaled = False
         self.cur: Optional[dict] = None
         self.file_handler: Optional[logging.Handler] = None
+        self.tray_icon = None
+        self.grips: List[tk.Widget] = []
         self.keys: List[str] = parse_keys(os.environ.get("GEMINI_API_KEYS", ""))
 
         self._setup_style()
@@ -197,9 +213,11 @@ class App:
         self._build_ui()
         self._setup_logging()
         self.load_settings()
+        self._apply_theme()
         self._update_key_label()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Unmap>", self._on_unmap)
         self.poll()
         self.refresh_stats()
         self._sched_tick()
@@ -217,12 +235,12 @@ class App:
             except tk.TclError:
                 pass
         ui_family = family or ("PingFang TC" if sys.platform == "darwin" else "TkDefaultFont")
+        self._ui_family = ui_family
         self.log_font = (ui_family, 9)
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=26)
-        style.configure("Start.TButton", font=(ui_family, 11, "bold"), padding=(14, 6))
-        style.configure("Hint.TLabel", foreground="#666666")
-        style.configure("Danger.TButton", foreground="#b91c1c")
+        self.style = ttk.Style()
+        self._native_theme = self.style.theme_use()
+        self._default_bg = self.root.cget("bg")
+        self._configure_custom_styles(dark=False)
 
     # ---------- 變數 ----------
     def _init_vars(self) -> None:
@@ -255,6 +273,14 @@ class App:
         self.sched_end_m = tk.StringVar(value="00")
         self.sched_daily = tk.BooleanVar(value=False)
         self.sched_text = tk.StringVar(value="")
+        # 自動切換模型
+        self.auto_var = tk.BooleanVar(value=False)
+        self.fallback_var = tk.StringVar(value=DEFAULT_FALLBACKS)
+        self.congest_var = tk.StringVar(value=str(engine.Config.congest_threshold))
+        self.recover_var = tk.StringVar(value=str(engine.Config.recover_minutes))
+        # 視窗選項
+        self.dark_var = tk.BooleanVar(value=False)
+        self.tray_var = tk.BooleanVar(value=False)
 
     # ---------- 介面 ----------
     def _build_ui(self) -> None:
@@ -337,6 +363,15 @@ class App:
         ttk.Label(sf, text="免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。也可直接輸入其他型號名稱。",
                   style="Hint.TLabel", wraplength=560, justify="left").grid(
             row=4, column=0, columnspan=4, sticky="w", pady=(2, 4))
+        auto_cb = ttk.Checkbutton(sf, text="伺服器塞車或額度用完時，自動切換到備援模型", variable=self.auto_var)
+        auto_cb.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 1))
+        self.settings_widgets.append(auto_cb)
+        ttk.Label(sf, text="備援模型（依序）").grid(row=6, column=0, sticky="e", padx=(0, 6), pady=3)
+        fb = ttk.Entry(sf, textvariable=self.fallback_var)
+        fb.grid(row=6, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=3)
+        self.settings_widgets.append(fb)
+        add_row(7, 0, "塞車判定（連續錯誤次數）", ttk.Spinbox(sf, from_=1, to=20, textvariable=self.congest_var, width=8))
+        add_row(7, 2, "回頭試主模型（分鐘）", ttk.Spinbox(sf, from_=1, to=1440, textvariable=self.recover_var, width=8))
         for i, (var, text) in enumerate((
             (self.prev_var, "附上上一頁 PDF 當上下文（品質較好，成本約 2 倍）"),
             (self.join_var, "合併時接回被分頁切斷的段落"),
@@ -344,7 +379,7 @@ class App:
             (self.move_var, "全部完成後，把原始 PDF 移進輸出資料夾"),
         )):
             cb = ttk.Checkbutton(sf, text=text, variable=var)
-            cb.grid(row=5 + i, column=0, columnspan=4, sticky="w", pady=1)
+            cb.grid(row=8 + i, column=0, columnspan=4, sticky="w", pady=1)
             self.settings_widgets.append(cb)
 
         right = ttk.Frame(mid)
@@ -407,7 +442,6 @@ class App:
         self.merge_btn = ttk.Button(bar, text="重組 Markdown", command=self.on_merge)
         self.merge_btn.pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="管理 Key…", command=self.on_manage_keys).pack(side="right")
-        ttk.Button(bar, text="重設 Key 計時", command=self.on_reset_keys).pack(side="right", padx=(0, 6))
         ttk.Label(bar, textvariable=self.key_var).pack(side="right", padx=10)
 
         # --- 進度 ---
@@ -432,8 +466,18 @@ class App:
 
         self._make_grip(6, "log")
 
-        ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).grid(
-            row=7, column=0, sticky="ew")
+        foot = ttk.Frame(root)
+        foot.grid(row=7, column=0, sticky="ew")
+        foot.columnconfigure(0, weight=1)
+        ttk.Label(foot, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).grid(
+            row=0, column=0, sticky="ew")
+        self.tray_cb = ttk.Checkbutton(foot, text="最小化時縮到系統匣", variable=self.tray_var,
+                                       command=self._on_tray_toggle)
+        self.tray_cb.grid(row=0, column=1, padx=(10, 6))
+        if sys.platform == "darwin":  # macOS 不支援縮到系統匣，請用 Dock 縮小視窗
+            self.tray_cb.grid_remove()
+        self.theme_btn = ttk.Button(foot, text="深色模式", command=self.on_toggle_theme)
+        self.theme_btn.grid(row=0, column=2, padx=(0, 6), pady=2)
 
     def _init_layout(self) -> None:
         """依實際內容決定視窗初始高度與最小高度。"""
@@ -453,6 +497,7 @@ class App:
         g.bind("<ButtonPress-1>", lambda e, k=which: self._grip_press(k, e))
         g.bind("<B1-Motion>", self._grip_drag)
         g.bind("<ButtonRelease-1>", self._grip_release)
+        self.grips.append(g)
 
     def _grip_frame(self, which: str):
         return self.list_frame if which == "list" else self.log_frame
@@ -493,7 +538,8 @@ class App:
                  ("interval", self.interval_var), ("max_fails", self.maxfails_var), ("consec", self.consec_var),
                  ("start_key", self.startkey_var), ("transport", self.transport_var), ("out", self.out_var),
                  ("sched_start_h", self.sched_start_h), ("sched_start_m", self.sched_start_m),
-                 ("sched_end_h", self.sched_end_h), ("sched_end_m", self.sched_end_m)]
+                 ("sched_end_h", self.sched_end_h), ("sched_end_m", self.sched_end_m),
+                 ("fallback", self.fallback_var), ("congest", self.congest_var), ("recover", self.recover_var)]
         for k, var in pairs:
             if k not in data:
                 continue
@@ -503,7 +549,8 @@ class App:
         for k, var in (("prev", self.prev_var), ("join", self.join_var),
                        ("markers", self.markers_var), ("move", self.move_var),
                        ("sched_start_on", self.sched_start_on), ("sched_end_on", self.sched_end_on),
-                       ("sched_daily", self.sched_daily)):
+                       ("sched_daily", self.sched_daily), ("auto", self.auto_var),
+                       ("dark", self.dark_var), ("tray", self.tray_var)):
             if k in data:
                 var.set(bool(data[k]))
         for p in data.get("pdfs", []):
@@ -522,6 +569,9 @@ class App:
             "sched_start_m": self.sched_start_m.get(), "sched_end_on": self.sched_end_on.get(),
             "sched_end_h": self.sched_end_h.get(), "sched_end_m": self.sched_end_m.get(),
             "sched_daily": self.sched_daily.get(),
+            "auto": self.auto_var.get(), "fallback": self.fallback_var.get(),
+            "congest": self.congest_var.get(), "recover": self.recover_var.get(),
+            "dark": self.dark_var.get(), "tray": self.tray_var.get(),
             "pdfs": [str(b["path"]) for b in self.books.values()],
         }
         try:
@@ -601,6 +651,7 @@ class App:
         ttk.Label(win, text="每行一把 Key（也可用逗號分隔）。多把 Key 會在額度用完時自動輪替。",
                   padding=10).pack(anchor="w")
         txt = tk.Text(win, width=64, height=12, font=self.log_font)
+        self._style_dialog(win, txt)
         txt.pack(padx=10, fill="both", expand=True)
         txt.insert("1.0", "\n".join(self.keys))
         save_env = tk.BooleanVar(value=True)
@@ -629,23 +680,203 @@ class App:
         if n == 0:
             self.key_var.set("API Key：尚未設定")
             return
-        out = self.out_var.get().strip() or "."
-        raw = engine.load_json(Path(out) / engine.KEY_STATUS_FILE, {})
-        now, ready, soon = time.time(), 0, None
-        for k in self.keys:
-            kid = hashlib.sha256(k.encode()).hexdigest()[:8]
-            try:
-                until = float(raw.get(kid, 0))
-            except (TypeError, ValueError):
-                until = 0.0
-            if until <= now:
-                ready += 1
-            else:
-                soon = until if soon is None else min(soon, until)
-        text = f"API Key：可用 {ready} / 共 {n} 把"
-        if ready == 0 and soon:
+        model = self.model_var.get().strip() or engine.Config.model
+        raw = engine.load_json(self._status_path(), {})
+        now = time.time()
+
+        def until_of(kid: str, m: str) -> float:
+            vals = []
+            for key in (f"{kid}|*", f"{kid}|{m}"):
+                try:
+                    vals.append(float(raw.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    vals.append(0.0)
+            return max(vals)
+
+        kids = [hashlib.sha256(k.encode()).hexdigest()[:8] for k in self.keys]
+        untils = [until_of(kid, model) for kid in kids]
+        ready = sum(1 for u in untils if u <= now)
+        text = f"API Key：{model} 可用 {ready} / 共 {n} 把"
+        if ready == 0:
+            soon = min(untils)
             text += f"（最快 {time.strftime('%H:%M', time.localtime(soon))} 恢復）"
+            if self.auto_var.get():  # 開了自動切換：看看備援模型是否還有可用的 Key
+                for m in [x for x in re.split(r"[,;\s]+", self.fallback_var.get()) if x]:
+                    if any(until_of(kid, m) <= now for kid in kids):
+                        text += f"，可改用 {m}"
+                        break
         self.key_var.set(text)
+
+    # ---------- 深色模式 ----------
+    def _configure_custom_styles(self, dark: bool) -> None:
+        style = self.style
+        style.configure("Treeview", rowheight=26)
+        style.configure("Start.TButton", font=(self._ui_family, 11, "bold"), padding=(14, 6))
+        style.configure("Hint.TLabel", foreground=DARK["hint"] if dark else "#666666")
+        style.configure("Danger.TButton", foreground=DARK["err"] if dark else "#b91c1c")
+
+    def _apply_theme(self) -> None:
+        dark = bool(self.dark_var.get())
+        style, root = self.style, self.root
+        if dark:
+            c = DARK
+            style.theme_use("clam")
+            style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
+                            bordercolor=c["border"], lightcolor=c["bg"], darkcolor=c["bg"],
+                            troughcolor=c["field"], insertcolor=c["fg"],
+                            selectbackground=c["sel"], selectforeground="#ffffff")
+            style.map(".", foreground=[("disabled", c["dis"])])
+            style.configure("TButton", background=c["btn"], foreground=c["fg"], bordercolor=c["border"],
+                            focuscolor=c["btn"])
+            style.map("TButton", background=[("active", c["hover"]), ("disabled", c["bg"])],
+                      foreground=[("disabled", c["dis"])])
+            style.configure("TEntry", fieldbackground=c["field"], foreground=c["fg"], insertcolor=c["fg"])
+            style.map("TEntry", fieldbackground=[("disabled", c["bg"])], foreground=[("disabled", c["dis"])])
+            for w in ("TCombobox", "TSpinbox"):
+                style.configure(w, fieldbackground=c["field"], background=c["btn"], foreground=c["fg"],
+                                arrowcolor=c["fg"], insertcolor=c["fg"],
+                                selectbackground=c["sel"], selectforeground="#ffffff")
+                style.map(w, fieldbackground=[("readonly", c["field"]), ("disabled", c["bg"])],
+                          foreground=[("disabled", c["dis"])], arrowcolor=[("disabled", c["dis"])])
+            style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
+                            indicatorbackground=c["field"], indicatorforeground=c["fg"],
+                            upperbordercolor=c["border"], lowerbordercolor=c["border"])
+            style.map("TCheckbutton", background=[("active", c["bg"])],
+                      indicatorbackground=[("selected", c["accent"]), ("disabled", c["bg"])])
+            style.configure("TLabelframe", background=c["bg"], bordercolor=c["border"])
+            style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+            style.configure("Treeview", background=c["field"], fieldbackground=c["field"],
+                            foreground=c["fg"], bordercolor=c["border"])
+            style.map("Treeview", background=[("selected", c["sel"])], foreground=[("selected", "#ffffff")])
+            style.configure("Treeview.Heading", background=c["btn"], foreground=c["fg"], bordercolor=c["border"])
+            style.map("Treeview.Heading", background=[("active", c["hover"])])
+            style.configure("TProgressbar", background=c["accent"], troughcolor=c["field"], bordercolor=c["border"])
+            style.configure("Vertical.TScrollbar", background=c["btn"], troughcolor=c["field"],
+                            arrowcolor=c["fg"], bordercolor=c["border"])
+            style.map("Vertical.TScrollbar", background=[("active", c["hover"])])
+            root.option_add("*TCombobox*Listbox.background", c["field"])
+            root.option_add("*TCombobox*Listbox.foreground", c["fg"])
+            root.option_add("*TCombobox*Listbox.selectBackground", c["sel"])
+            root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+            bg, fg, field, warn, err, grip = c["bg"], c["fg"], c["field"], c["warn"], c["err"], c["border"]
+        else:
+            style.theme_use(self._native_theme)
+            root.option_add("*TCombobox*Listbox.background", "#ffffff")
+            root.option_add("*TCombobox*Listbox.foreground", "#000000")
+            root.option_add("*TCombobox*Listbox.selectBackground", "#0078d7")
+            root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+            bg, fg, field, warn, err, grip = self._default_bg, "#000000", "#ffffff", "#b45309", "#b91c1c", self._default_bg
+        self._configure_custom_styles(dark)
+        root.configure(bg=bg)
+        self.log_text.configure(bg=field, fg=fg, insertbackground=fg)
+        self.log_text.tag_configure("warn", foreground=warn)
+        self.log_text.tag_configure("error", foreground=err)
+        for gw in self.grips:
+            gw.configure(bg=grip)
+        self.theme_btn.configure(text="淺色模式" if dark else "深色模式")
+        self._set_titlebar_dark(dark)
+
+    def _set_titlebar_dark(self, dark: bool) -> None:
+        """Windows 10/11：讓視窗標題列也跟著變深色（失敗就略過）。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            val = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE（新舊版 Windows 的代碼不同）
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:
+            pass
+
+    def on_toggle_theme(self) -> None:
+        self.dark_var.set(not self.dark_var.get())
+        self._apply_theme()
+        self.save_settings()
+
+    def _style_dialog(self, win, txt) -> None:
+        if self.dark_var.get():
+            win.configure(bg=DARK["bg"])
+            txt.configure(bg=DARK["field"], fg=DARK["fg"], insertbackground=DARK["fg"])
+
+    # ---------- 縮到系統匣 ----------
+    def _on_tray_toggle(self) -> None:
+        if self.tray_var.get() and not TRAY_AVAILABLE:
+            msg = ("macOS 不支援縮到系統匣，請直接用 Dock 縮小視窗。" if sys.platform == "darwin"
+                   else "需要先安裝 pystray 與 pillow：\n    pip install pystray pillow\n安裝後重新開啟程式。")
+            messagebox.showinfo("無法使用系統匣", msg)
+            self.tray_var.set(False)
+            return
+        self.save_settings()
+
+    def _on_unmap(self, event) -> None:
+        if event.widget is self.root and self.tray_var.get() and TRAY_AVAILABLE:
+            self.root.after(150, self._maybe_hide_to_tray)
+
+    def _maybe_hide_to_tray(self) -> None:
+        try:
+            if self.root.state() == "iconic":  # 使用者按了「縮小」才收進系統匣
+                self._hide_to_tray()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _tray_image():
+        img = Image.new("RGB", (64, 64), "#2563eb")
+        d = ImageDraw.Draw(img)
+        d.rectangle((14, 14, 50, 25), fill="white")  # 「T」字
+        d.rectangle((26, 25, 38, 52), fill="white")
+        return img
+
+    def _hide_to_tray(self) -> None:
+        self.root.withdraw()
+        if self.tray_icon is None:
+            menu = pystray.Menu(
+                pystray.MenuItem("顯示視窗", lambda icon, item: self.q.put(("tray", "show")), default=True),
+                pystray.MenuItem("結束程式", lambda icon, item: self.q.put(("tray", "quit"))),
+            )
+            self.tray_icon = pystray.Icon("trpg_translator", self._tray_image(), "TRPG 規則書翻譯工具", menu)
+            self.tray_icon.run_detached()
+            try:
+                self.tray_icon.notify("仍在背景執行。點兩下系統匣圖示可還原視窗。", "TRPG 翻譯工具")
+            except Exception:
+                pass
+
+    def _on_tray_event(self, action: str) -> None:
+        if action == "show":
+            self._restore_from_tray()
+        elif action == "quit":
+            self._restore_from_tray()
+            self.on_close()
+
+    def _restore_from_tray(self) -> None:
+        self._stop_tray_icon()
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _stop_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+    def _update_tray_title(self) -> None:
+        if self.tray_icon is None:
+            return
+        t = self.progress_text.get() if self.running else (self.sched_text.get() or "閒置")
+        try:
+            self.tray_icon.title = ("TRPG 翻譯：" + t)[:120]
+        except Exception:
+            pass
 
     # ---------- 設定驗證 ----------
     @staticmethod
@@ -675,7 +906,13 @@ class App:
                 page_markers=self.markers_var.get(),
                 join_pages=self.join_var.get(),
                 move_pdf=self.move_var.get(),
+                auto_switch=self.auto_var.get(),
+                fallback_models=[m for m in re.split(r"[,;\s]+", self.fallback_var.get()) if m],
+                congest_threshold=self._num(self.congest_var, "塞車判定次數", 1, 20),
+                recover_minutes=self._num(self.recover_var, "回頭試主模型（分鐘）", 1, 1440),
             )
+            if cfg.auto_switch and not cfg.fallback_models:
+                raise ValueError("已啟用自動切換模型，但「備援模型」是空的。請至少填一個，例如：gemini-3.5-flash-lite")
             redo_text = self.redo_var.get().strip()
             if redo_text:
                 try:
@@ -874,6 +1111,7 @@ class App:
                 engine.STOP.set()
                 self.stop_btn.configure(state="disabled")
             self._update_sched_text(now)
+            self._update_tray_title()
         except Exception:
             pass
         self.root.after(1000, self._sched_tick)
@@ -909,7 +1147,7 @@ class App:
                 parts.append(f"{self._fmt_ts(self._next_occurrence(sc['end'][0], sc['end'][1], base))} 停止")
             self.sched_text.set("預計：" + "，".join(parts) + ("（每天重複）" if sc["daily"] else ""))
 
-    # ---------- 開啟輸出資料夾 / 重設 Key 計時 ----------
+    # ---------- 開啟輸出資料夾 ----------
     def on_open_out(self) -> None:
         v = self.out_var.get().strip()
         if not v:
@@ -924,25 +1162,6 @@ class App:
     def _status_path(self) -> Path:
         return Path(self.out_var.get().strip() or ".") / engine.KEY_STATUS_FILE
 
-    def on_reset_keys(self) -> None:
-        if not self.keys:
-            messagebox.showinfo("尚未設定 API Key", "目前沒有任何 Key。")
-            return
-        if not messagebox.askyesno(
-                "重設 Key 計時",
-                "這會清除所有 Key 的冷卻計時，讓它們立刻都可以再被使用。\n"
-                "（若 Google 那邊的額度其實還沒恢復，下一次請求會再被限流，該 Key 會重新冷卻。）\n\n確定要重設嗎？"):
-            return
-        try:
-            if self.km is not None:
-                self.km.reset_all()  # 執行中：同時清除記憶體與檔案，等待中的 Key 也會立刻解除
-            else:
-                engine.save_json(self._status_path(), {})
-        except Exception as e:
-            messagebox.showerror("重設失敗", str(e))
-            return
-        engine.log.info("已重設所有 Key 的冷卻計時。")
-        self._update_key_label()
 
     def _worker(self, token, jobs, cfg, keys) -> None:
         log = engine.log
@@ -1003,6 +1222,9 @@ class App:
                 kind = item[0]
                 if kind == "log":
                     self.append_log(item[1], item[2])
+                    continue
+                if kind == "tray":
+                    self._on_tray_event(item[1])
                     continue
                 if item[1] is not self.run_token:
                     continue  # 已被「強制停止」作廢的舊工作事件，直接忽略
@@ -1139,6 +1361,7 @@ class App:
             if not messagebox.askyesno("確定要結束？", msg):
                 return
             engine.abort_all()
+        self._stop_tray_icon()
         self.save_settings()
         self.root.destroy()
 

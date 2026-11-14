@@ -128,6 +128,11 @@ class Config:
     glossary_warn: int = 500
     output_root: str = "."           # 輸出資料夾的上層目錄（GUI 使用；CLI 預設為目前資料夾）
     move_pdf: bool = True            # 全部完成後是否把原始 PDF 移進輸出資料夾
+    # --- 自動切換模型 ---
+    auto_switch: bool = False        # 伺服器塞車 / 額度用完時，自動改用備援模型
+    fallback_models: List[str] = field(default_factory=list)  # 備援模型（依優先順序）
+    congest_threshold: int = 2       # 同一模型連續幾次伺服器錯誤（503/504/逾時）就判定塞車
+    recover_minutes: int = 15        # 判定塞車後，隔幾分鐘再回頭試優先順序較前的模型
     redo: Set[int] = field(default_factory=set)
 
 
@@ -245,7 +250,62 @@ def next_daily_reset_ts() -> float:
 # ============================================================
 # API Key 管理
 # ============================================================
+class ModelRouter:
+    """決定每一次請求要用哪個模型。
+
+    - 關閉自動切換：永遠只用主要模型。
+    - 開啟：依「主要模型 → 備援模型…」的順序使用。某模型連續出現伺服器錯誤（503 / 504 / 逾時）
+      就判定為塞車，暫時跳過；經過一段時間後，會回頭試優先順序較前的模型。
+    """
+
+    def __init__(self, primary: str, fallbacks=(), enabled: bool = False,
+                 threshold: int = 2, recover_minutes: int = 15):
+        chain = [primary]
+        for m in fallbacks or ():
+            m = (m or "").strip()
+            if m and m not in chain:
+                chain.append(m)
+        self.primary = primary
+        self.enabled = bool(enabled) and len(chain) > 1
+        self.chain: List[str] = chain if self.enabled else [primary]
+        self.threshold = max(1, int(threshold))
+        self.recover = max(1, int(recover_minutes)) * 60
+        self.congested_until: Dict[str, float] = {}
+        self.streak: Dict[str, int] = {}
+
+    @classmethod
+    def from_config(cls, cfg: "Config") -> "ModelRouter":
+        return cls(cfg.model, cfg.fallback_models, cfg.auto_switch, cfg.congest_threshold, cfg.recover_minutes)
+
+    def candidates(self) -> List[str]:
+        """依優先順序、排除「塞車冷卻中」的模型；全部都在冷卻就照原順序全部列出。"""
+        now = time.time()
+        ok = [m for m in self.chain if self.congested_until.get(m, 0.0) <= now]
+        return ok or list(self.chain)
+
+    def record_ok(self, model: str) -> None:
+        self.streak[model] = 0
+
+    def record_congestion(self, model: str) -> bool:
+        """記一次伺服器端錯誤；同一模型連續達門檻就標為塞車並回傳 True。"""
+        if not self.enabled:
+            return False
+        self.streak[model] = self.streak.get(model, 0) + 1
+        if self.streak[model] >= self.threshold:
+            self.streak[model] = 0
+            self.congested_until[model] = time.time() + self.recover
+            return True
+        return False
+
+    def has_other(self, model: str) -> bool:
+        now = time.time()
+        return any(m != model and self.congested_until.get(m, 0.0) <= now for m in self.chain)
+
+
 class KeyManager:
+    """管理多把 API Key。冷卻計時以「Key × 模型」分開記錄（Google 的額度本來就是每個模型各自計算），
+    所以某模型的每日額度用完時，同一把 Key 仍可用於其他模型。"""
+
     def __init__(self, keys: List[str], start_index: int, timeout_sec: int,
                  status_path: str = KEY_STATUS_FILE):
         self.gen = RUN_GEN[0]
@@ -259,19 +319,21 @@ class KeyManager:
         self.ids = [hashlib.sha256(k.encode()).hexdigest()[:8] for k in self.keys]
         self.status_path = Path(status_path)
         raw = load_json(self.status_path, {})
+        valid_ids = set(self.ids)
         self.until: Dict[str, float] = {}
-        for kid in self.ids:
+        for k, v in (raw.items() if isinstance(raw, dict) else []):
+            kid, sep, _model = str(k).partition("|")
+            if not sep or kid not in valid_ids:
+                continue  # 舊版（只記 Key、不分模型）的紀錄不沿用
             try:
-                self.until[kid] = float(raw.get(kid, 0))
+                self.until[str(k)] = float(v)
             except (TypeError, ValueError):
-                self.until[kid] = 0.0
+                pass
         self.timeout_ms = timeout_sec * 1000
         self._clients: Dict[int, genai.Client] = {}
         self._last_req = 0.0
         self.index = start_index if 0 <= start_index < len(self.keys) else 0
-        if self._until(self.index) > time.time():
-            log.info("指定的 %s 仍在冷卻中，改找其他可用 Key…", self.label)
-            self.switch()
+        self.router: Optional[ModelRouter] = None
 
     # ---- 基本屬性 ----
     @property
@@ -287,59 +349,80 @@ class KeyManager:
             )
         return self._clients[self.index]
 
-    def _until(self, idx: int) -> float:
-        return self.until.get(self.ids[idx], 0.0)
+    def _until(self, idx: int, model: Optional[str] = None) -> float:
+        kid = self.ids[idx]
+        u = self.until.get(f"{kid}|*", 0.0)  # 整把 Key 的冷卻（無效或無權限）
+        if model:
+            u = max(u, self.until.get(f"{kid}|{model}", 0.0))
+        return u
 
     def _save(self) -> None:
+        now = time.time()
+        self.until = {k: v for k, v in self.until.items() if v > now}  # 順便清掉已過期的紀錄
         try:
             save_json(self.status_path, self.until)
         except Exception as e:
             log.warning("無法儲存 Key 狀態：%s", e)
 
     # ---- 冷卻與切換 ----
-    def cooldown(self, until_ts: float) -> None:
-        self.until[self.ids[self.index]] = until_ts
+    def cooldown(self, until_ts: float, model: str) -> None:
+        """目前這把 Key 在「指定模型」上冷卻到 until_ts（不影響其他模型）。"""
+        self.until[f"{self.ids[self.index]}|{model}"] = until_ts
         self._save()
 
     def bad_key(self, reason: str) -> None:
-        log.warning("🚫 %s 疑似無效或無權限（%s），冷卻 %d 分鐘", self.label, reason, BAD_KEY_COOLDOWN // 60)
-        self.cooldown(time.time() + BAD_KEY_COOLDOWN)
+        log.warning("🚫 %s 疑似無效或無權限（%s），所有模型冷卻 %d 分鐘", self.label, reason, BAD_KEY_COOLDOWN // 60)
+        self.until[f"{self.ids[self.index]}|*"] = time.time() + BAD_KEY_COOLDOWN
+        self._save()
 
-    def switch(self) -> bool:
-        """切到下一把可用的 Key（優先其他 Key，最後才是目前這把）。
-        全部冷卻中就顯示倒數等待。被 Ctrl+C 中止回傳 False。"""
+    def has_ready(self, model: str) -> bool:
+        now = time.time()
+        return any(self._until(i, model) <= now for i in range(len(self.keys)))
+
+    def use_ready(self, model: str) -> bool:
+        """讓目前使用的 Key 指向「對這個模型可用」的 Key（優先沿用目前這把）。都不可用回傳 False。"""
+        now = time.time()
         n = len(self.keys)
-        while not STOP.is_set() and self.gen == RUN_GEN[0]:
-            now = time.time()
-            for i in range(1, n + 1):
-                cand = (self.index + i) % n
-                if self._until(cand) <= now:
-                    self.index = cand
-                    return True
-            target = min(self._until(i) for i in range(n))
-            self._countdown(target)
+        if self._until(self.index, model) <= now:
+            return True
+        for i in range(1, n):
+            cand = (self.index + i) % n
+            if self._until(cand, model) <= now:
+                self.index = cand
+                return True
         return False
 
-    def _countdown(self, target: float) -> None:
-        soonest = min(range(len(self.keys)), key=self._until)
-        resume = datetime.datetime.fromtimestamp(target).strftime("%m/%d %H:%M:%S")
-        log.warning("⏳ %d 把 Key 全部冷卻中，最快 %s 恢復（Key #%d）", len(self.keys), resume, soonest + 1)
-        while not STOP.is_set() and self.gen == RUN_GEN[0] and time.time() < target:
-            # 每秒重新計算：使用者按「重設 Key 計時」後，等待會立刻結束
-            target = min(self._until(i) for i in range(len(self.keys)))
-            if time.time() >= target:
-                break
-            remaining = int(target - time.time()) + 1
+    def earliest_ready(self, models: List[str]) -> Tuple[float, int, str]:
+        best = (float("inf"), 0, models[0] if models else "")
+        for m in models:
+            for i in range(len(self.keys)):
+                u = self._until(i, m)
+                if u < best[0]:
+                    best = (u, i, m)
+        return best
+
+    def wait_any_ready(self, models: List[str]) -> bool:
+        """所有 Key × 候選模型都在冷卻：顯示倒數並等待，直到任何一組恢復。被中止回傳 False。"""
+        t, i, m = self.earliest_ready(models)
+        resume = datetime.datetime.fromtimestamp(t).strftime("%m/%d %H:%M:%S")
+        log.warning("⏳ 所有 Key 在「%s」都冷卻中，最快 %s 恢復（Key #%d，%s）",
+                    " / ".join(models), resume, i + 1, m)
+        while not STOP.is_set() and self.gen == RUN_GEN[0]:
+            t, i, m = self.earliest_ready(models)  # 每秒重算（外部清除冷卻時能立刻解除等待）
+            if time.time() >= t:
+                print("\r" + " " * 50 + "\r", end="", flush=True)
+                return True
+            remaining = int(t - time.time()) + 1
             h, r = divmod(max(remaining, 0), 3600)
-            m, s = divmod(r, 60)
-            print(f"\r💤 倒數 [{h:02d}:{m:02d}:{s:02d}]（Ctrl+C 可中止）", end="", flush=True)
+            mi, sec = divmod(r, 60)
+            print(f"\r💤 倒數 [{h:02d}:{mi:02d}:{sec:02d}]（Ctrl+C 可中止）", end="", flush=True)
             interruptible_sleep(1)
         print("\r" + " " * 50 + "\r", end="", flush=True)
+        return False
 
     def reset_all(self) -> None:
-        """清除所有 Key 的冷卻計時（手動重設）。"""
-        for kid in list(self.until):
-            self.until[kid] = 0.0
+        """清除所有冷卻計時（手動重設；一般不需要，因為冷卻已依模型分開計時）。"""
+        self.until = {}
         self._save()
 
     def wait_turn(self, min_interval: float) -> None:
@@ -488,6 +571,11 @@ class BookJob:
         self.tokens_out = 0
         self.last_upload_s = 0.0
         self.last_gen_s = 0.0
+        if getattr(km, "router", None) is None:
+            km.router = ModelRouter.from_config(cfg)  # 同一輪的多本書共用同一個 router（塞車狀態可延續）
+        self.router: ModelRouter = km.router
+        self.active_model: Optional[str] = None
+        self.no_thinking: Set[str] = set()  # 不支援 thinking 設定的模型
 
     # ---------- 路徑 / 狀態 ----------
     def page_path(self, n: int) -> Path:
@@ -637,7 +725,7 @@ class BookJob:
 """
 
     # ---------- 呼叫模型 ----------
-    def call_model(self, n: int):
+    def call_model(self, n: int, model: str):
         self.last_upload_s = 0.0
         self.last_gen_s = 0.0
         parts, cleanup = [], []
@@ -655,12 +743,13 @@ class BookJob:
                     cleanup.append((client, f.name))
 
             kwargs = dict(response_mime_type="application/json", response_schema=PageTranslation)
-            if self.cfg.thinking and self.cfg.thinking.lower() not in ("none", "default"):
+            if (self.cfg.thinking and self.cfg.thinking.lower() not in ("none", "default")
+                    and model not in self.no_thinking):
                 kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=self.cfg.thinking)
 
             t_gen = time.time()
             resp = self.km.client.models.generate_content(
-                model=self.cfg.model,
+                model=model,
                 contents=[*parts, self.build_prompt(n)],
                 config=types.GenerateContentConfig(**kwargs),
             )
@@ -673,7 +762,7 @@ class BookJob:
                 except Exception:
                     pass
 
-    def commit_page(self, n: int, result: PageTranslation, usage) -> None:
+    def commit_page(self, n: int, result: PageTranslation, usage, model: str) -> None:
         # 先存術語庫再存頁面：中途當機時，重做該頁是安全的（術語不會重複覆蓋）
         added = self.add_terms(result.new_terms)
         if added:
@@ -685,7 +774,7 @@ class BookJob:
             "translation": result.translation.strip(),
             "last_english_anchor": result.last_english_anchor.strip(),
             "new_terms": [t.model_dump() for t in result.new_terms],
-            "model": self.cfg.model,
+            "model": model,
             "key_id": self.km.ids[self.km.index],
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
@@ -695,23 +784,46 @@ class BookJob:
             self.tokens_out += getattr(usage, "candidates_token_count", 0) or 0
 
     # ---------- 單頁：重試 / 輪替 / 失敗記錄 ----------
-    def handle_rate_limit(self, e: Exception) -> bool:
+    def handle_rate_limit(self, e: Exception, model: str) -> None:
         kind, retry = classify_rate_limit(e)
         km = self.km
         if kind == "daily":
             until = next_daily_reset_ts()
             when = datetime.datetime.fromtimestamp(until).strftime("%m/%d %H:%M")
-            log.warning("❄️ %s 觸發每日額度上限，冷卻至 %s", km.label, when)
+            log.warning("❄️ %s 在「%s」觸發每日額度上限，冷卻至 %s（其他模型不受影響）", km.label, model, when)
         else:
             wait = min(max(retry or 60.0, 5.0), 300.0) + 1
             until = time.time() + wait
-            log.warning("⚠️ %s 觸發短期頻率限制，冷卻 %d 秒", km.label, int(wait))
-        km.cooldown(until)
+            log.warning("⚠️ %s 在「%s」觸發短期頻率限制，冷卻 %d 秒", km.label, model, int(wait))
+        km.cooldown(until, model)
+        # 先換成「對這個模型仍可用」的其他 Key；都沒有的話，下一輪 choose_model 會改用備援模型或等待
         old = km.index
-        ok = km.switch()
-        if ok and km.index != old:
+        if km.use_ready(model) and km.index != old:
             log.info("🔄 已切換至 %s", km.label)
-        return ok
+
+    def choose_model(self) -> Optional[str]:
+        """挑出這次請求要用的模型（依優先順序，且要有可用的 Key）。全部都在冷卻時等待。"""
+        r, km = self.router, self.km
+        while not STOP.is_set() and self.alive():
+            for pool in (r.candidates(), r.chain):  # 先排除「塞車中」的模型；都不行再不管塞車
+                for m in pool:
+                    if km.use_ready(m):
+                        if m != self.active_model:
+                            if self.active_model:
+                                log.info("🔀 切換模型：%s → %s", self.active_model, m)
+                            self.active_model = m
+                        return m
+            if not km.wait_any_ready(r.chain):
+                return None
+        return None
+
+    def _on_congestion(self, model: str) -> bool:
+        """記一次伺服器端錯誤；若因此判定塞車且有其他模型可用，回傳 True（呼叫端應立刻換模型重試）。"""
+        r = self.router
+        if r.record_congestion(model) and r.has_other(model):
+            log.warning("🚦 模型 %s 連續伺服器錯誤，判定塞車，%d 分鐘內改用備援模型", model, r.recover // 60)
+            return True
+        return False
 
     def mark_failed(self, n: int, err: str) -> str:
         log.error("❌ 第 %d 頁失敗，已記錄並跳過：%s", n, err)
@@ -720,18 +832,21 @@ class BookJob:
 
     def translate_page(self, n: int) -> str:
         """回傳 'ok' | 'failed' | 'stopped'"""
-        cfg, km = self.cfg, self.km
-        fails = rate_hits = 0
+        cfg, km, r = self.cfg, self.km, self.router
+        fails = rate_hits = switches = 0
         last_err = ""
         while True:
             if STOP.is_set() or not self.alive():
+                return "stopped"
+            model = self.choose_model()
+            if model is None or not self.alive():
                 return "stopped"
             km.wait_turn(cfg.min_interval)
             if STOP.is_set() or not self.alive():
                 return "stopped"
             t0 = time.time()
             try:
-                result, usage = self.call_model(n)
+                result, usage = self.call_model(n, model)
             except FatalError:
                 raise
             except errors.ClientError as e:
@@ -741,22 +856,34 @@ class BookJob:
                     rate_hits += 1
                     if rate_hits > cfg.max_rate_limit_retries:
                         return self.mark_failed(n, f"429 處理超過 {cfg.max_rate_limit_retries} 次")
-                    if not self.handle_rate_limit(e):
-                        return "stopped"
+                    self.handle_rate_limit(e, model)
                     continue
                 if code in (401, 403) or (code == 400 and "api key" in str(e).lower()):
                     km.bad_key(last_err)
-                    if not km.switch():
-                        return "stopped"
+                    continue
+                if code == 400 and "thinking" in str(e).lower() and model not in self.no_thinking:
+                    self.no_thinking.add(model)
+                    log.warning("⚠️ 模型 %s 不支援目前的思考強度設定，改為不指定思考強度後重試", model)
                     continue
                 if code == 404:
-                    raise FatalError(f"找不到模型或資源 (404)，請檢查 --model（目前：{cfg.model}）：{e}")
+                    if r.enabled and r.has_other(model):
+                        log.warning("⚠️ 找不到模型 %s（404），1 小時內改用其他模型", model)
+                        r.congested_until[model] = time.time() + 3600
+                        continue
+                    raise FatalError(f"找不到模型或資源 (404)，請檢查模型名稱（目前：{model}）：{e}")
                 fails += 1
                 log.warning("⚠️ 第 %d 頁用戶端錯誤 (%s)，第 %d/%d 次", n, last_err, fails, cfg.max_fails)
             except errors.ServerError as e:
                 fails += 1
                 last_err = f"{getattr(e, 'code', '5xx')}: {str(e)[:200]}"
-                log.warning("⚠️ 伺服器錯誤 (%s)，耗時 %.0fs，第 %d/%d 次", last_err, time.time() - t0, fails, cfg.max_fails)
+                log.warning("⚠️ 伺服器錯誤 (%s)，模型 %s，耗時 %.0fs，第 %d/%d 次",
+                            last_err, model, time.time() - t0, fails, cfg.max_fails)
+                if self._on_congestion(model):
+                    switches += 1
+                    if switches >= max(len(r.chain), 2) * 2:
+                        return self.mark_failed(n, f"各模型都持續塞車：{last_err}")
+                    fails = 0  # 換了模型，重新計算這一頁的重試次數
+                    continue
             except (EmptyResponse, ValueError) as e:  # ValueError 涵蓋 pydantic ValidationError
                 fails += 1
                 last_err = f"{type(e).__name__}: {str(e)[:200]}"
@@ -766,12 +893,16 @@ class BookJob:
                 last_err = f"{type(e).__name__}: {str(e)[:200]}"
                 log.warning("⚠️ 第 %d 頁發生錯誤 (%s)，第 %d/%d 次", n, last_err, fails, cfg.max_fails)
                 log.debug("traceback", exc_info=True)
+                if "timeout" in type(e).__name__.lower() and self._on_congestion(model):  # 逾時也視為塞車徵兆
+                    fails = 0
+                    continue
             else:
                 if not self.alive():  # 強制停止後才回來的結果：直接丟棄
                     return "stopped"
-                self.commit_page(n, result, usage)
-                log.info("✅ 第 %d 頁完成（總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, time.time() - t0,
-                         self.last_upload_s, self.last_gen_s,
+                r.record_ok(model)
+                self.commit_page(n, result, usage, model)
+                log.info("✅ 第 %d 頁完成（%s｜總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, model,
+                         time.time() - t0, self.last_upload_s, self.last_gen_s,
                          getattr(usage, "prompt_token_count", "?"), getattr(usage, "candidates_token_count", "?"),
                          getattr(usage, "thoughts_token_count", "?"))
                 return "ok"
@@ -807,6 +938,8 @@ class BookJob:
         start = max(1, cfg.start)
         end = cfg.end if 0 < cfg.end <= self.total else self.total
         log.info("📖 [%s] 共 %d 頁，本次範圍 %d~%d", self.name, self.total, start, end)
+        if self.router.enabled:
+            log.info("🔀 自動切換模型已啟用：%s", " → ".join(self.router.chain))
 
         consecutive = 0
         aborted = False
@@ -906,6 +1039,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--timeout", type=int, default=Config.timeout, help="單次請求逾時秒數（建議 ≥300；太短會把慢但成功的請求砍成 504）")
     p.add_argument("--transport", choices=["files", "inline"], default=Config.transport,
                    help="PDF 傳送方式：files = 先上傳 Files API（同第一版，預設）；inline = 內嵌於請求")
+    p.add_argument("--auto-switch", action="store_true", help="伺服器塞車或額度用完時，自動改用備援模型")
+    p.add_argument("--fallback-models", default="", help="備援模型（依優先順序，逗號分隔）")
+    p.add_argument("--congest-threshold", type=int, default=Config.congest_threshold,
+                   help="同一模型連續幾次伺服器錯誤就判定塞車")
+    p.add_argument("--recover-minutes", type=int, default=Config.recover_minutes,
+                   help="判定塞車後，隔幾分鐘再回頭試優先順序較前的模型")
     p.add_argument("--max-fails", type=int, default=Config.max_fails)
     p.add_argument("--max-consecutive-fails", type=int, default=Config.max_consecutive_fails)
     p.add_argument("--with-prev-page", action="store_true", help="額外附上上一頁 PDF 當上下文（約 2 倍成本）")
@@ -941,6 +1080,9 @@ def main(argv=None) -> int:
         start_key=args.start_key, max_fails=args.max_fails,
         max_consecutive_fails=args.max_consecutive_fails, min_interval=args.min_interval,
         timeout=args.timeout, transport=args.transport, with_prev_page=args.with_prev_page,
+        auto_switch=args.auto_switch, congest_threshold=args.congest_threshold,
+        recover_minutes=args.recover_minutes,
+        fallback_models=[m.strip() for m in args.fallback_models.split(",") if m.strip()],
         page_markers=args.page_markers, join_pages=not args.no_join,
         redo=parse_page_spec(args.redo) if args.redo else set(),
     )
