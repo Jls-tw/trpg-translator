@@ -25,7 +25,7 @@ TRPG 規則書 PDF 逐頁翻譯工具 v2
 """
 from __future__ import annotations
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 import argparse
 import datetime
@@ -105,7 +105,15 @@ class FatalError(Exception):
 
 
 class EmptyResponse(Exception):
-    """模型回傳空內容（可能被安全機制攔截或輸出被截斷）。"""
+    """模型回傳空內容（可能輸出被截斷）。"""
+
+
+class BlockedResponse(EmptyResponse):
+    """請求或回應被 Google 的安全機制攔截（例如 PROHIBITED_CONTENT、SAFETY、IMAGE_SAFETY）。"""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
 
 
 # ============================================================
@@ -135,6 +143,11 @@ class Config:
     fallback_models: List[str] = field(default_factory=list)  # 備援模型（依優先順序）
     congest_threshold: int = 2       # 同一模型連續幾次伺服器錯誤（503/504/逾時）就判定塞車
     recover_minutes: int = 15        # 判定塞車後，隔幾分鐘再回頭試優先順序較前的模型
+    # --- 提示詞與內容攔截 ---
+    prompt_file: str = ""            # 系統提示詞檔；空字串 = 引擎同資料夾的 system_prompt.txt（不存在就用內建預設）
+    relax_safety: bool = True        # 放寬「可調整」的安全過濾（成人向 / 恐怖 / 暴力等虛構內容）
+    text_fallback: bool = True       # 被安全機制攔截時，改用純文字（不附 PDF 圖片）重試
+    block_max_attempts: int = 4      # 同一頁被攔截時，最多嘗試幾種「模型 × 模式」組合
     redo: Set[int] = field(default_factory=set)
 
 
@@ -468,24 +481,154 @@ def open_pdf(path: Path, work_dir: Path) -> Optional[PdfReader]:
         return None
 
 
+BLOCK_REASONS = {"PROHIBITED_CONTENT", "SAFETY", "BLOCKLIST", "IMAGE_SAFETY", "SPII"}
+# 官方文件列為「可調整」的安全類別；PROHIBITED_CONTENT 等核心保護不受這些設定影響
+SAFETY_CATEGORIES = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+
+
+def _enum_name(x) -> str:
+    if x is None:
+        return ""
+    name = getattr(x, "name", None)
+    return str(name if name else x).split(".")[-1].strip()
+
+
 def parse_response(resp) -> PageTranslation:
     text = ""
     try:
         text = (getattr(resp, "text", None) or "").strip()
     except Exception:
         pass
+    finish = block = None
+    try:
+        finish = resp.candidates[0].finish_reason
+    except Exception:
+        pass
+    try:
+        block = resp.prompt_feedback.block_reason
+    except Exception:
+        pass
+    fin, blk = _enum_name(finish), _enum_name(block)
+    for reason in (blk, fin):
+        if reason in BLOCK_REASONS:  # 即使有部分文字，被攔截時輸出通常是截斷的，不可採用
+            raise BlockedResponse(reason, f"被安全機制攔截 (finish_reason={fin or '-'}, block_reason={blk or '-'})")
     if not text:
-        finish = block = None
-        try:
-            finish = resp.candidates[0].finish_reason
-        except Exception:
-            pass
-        try:
-            block = resp.prompt_feedback.block_reason
-        except Exception:
-            pass
-        raise EmptyResponse(f"空回應 (finish_reason={finish}, block_reason={block})")
+        raise EmptyResponse(f"空回應 (finish_reason={fin or '-'}, block_reason={blk or '-'})")
     return PageTranslation.model_validate_json(text)
+
+
+# ============================================================
+# 系統提示詞（存放在獨立檔案，可由使用者修改）
+# ============================================================
+PROMPT_FILE_NAME = "system_prompt.txt"
+PROMPT_PLACEHOLDERS = {
+    "page": "目前頁碼",
+    "prev_note": "「附上上一頁 PDF」模式的說明（未啟用時為空）",
+    "continuity": "跨頁接續資訊（自動產生）",
+    "glossary": "本頁相關的術語庫（JSON，自動產生）",
+}
+PROMPT_REQUIRED = ("page", "glossary")
+PROMPT_FILE_HEADER = """;; TRPG 翻譯工具：系統提示詞（可自由修改）
+;; 以「;;」開頭的行是註解，翻譯時會被忽略。
+;; 可用的變數（每一頁翻譯時自動替換）：
+;;   {{page}}        目前頁碼
+;;   {{prev_note}}   「附上上一頁 PDF」模式的說明（未啟用時為空）
+;;   {{continuity}}  跨頁接續資訊（自動產生）
+;;   {{glossary}}    本頁相關的術語庫（JSON，自動產生）
+;; 修改後存檔，下一頁翻譯就會套用，不需要重新啟動程式。
+;; 刪除本檔案即可回到內建預設。
+"""
+DEFAULT_PROMPT_TEMPLATE = r"""你是一位頂級的 TRPG 規則書譯者。請翻譯本頁 PDF 內容（第 {{page}} 頁）。{{prev_note}}
+
+## 文件性質（請先閱讀）
+這是一本已出版的桌上角色扮演遊戲（TRPG）規則書，屬於虛構作品。成人向的規則書常會描寫恐怖、暴力、死亡、黑暗或成人主題，也常附有 NPC、怪物與角色的背景資料。
+你的工作只有「忠實翻譯」書中既有的文字：照原意翻成中文，不新增、不擴寫、不評論，也不要為了避開敏感用詞而刪減或改寫原文；以中性、客觀的語氣呈現即可。
+角色資料中的年齡、外貌、身分等欄位，請照原文如實翻譯，不要自行補充原文沒有的細節。
+
+【跨頁接續資訊】(最優先規則)
+{{continuity}}
+
+## 翻譯規範
+1. 使用繁體中文與台灣 TRPG 慣用語（例：Saving Throw -> 豁免、Proficiency -> 熟練），不使用中國大陸用語。
+2. 稍後會提供一份術語庫，譯文中請直接使用對應的中文譯名；不要輸出 <glossary>、term= 等任何標籤代碼，譯文必須是純淨、可直接閱讀的中文。
+3. 以段落為單位翻譯，避免破碎句子。
+4. 忽略裝飾性圖片、頁首、頁尾、頁碼。
+5. new_terms 欄位只收錄具有長期參考價值的專有名詞：NPC/角色姓名、地名、重要場景物件、核心遊戲機制、角色屬性、關鍵物品、狀態效果。不收錄片語、諺語、句子，或已出現在術語庫中的詞彙；沒有符合條件的新術語就留空。
+
+## Markdown 排版規範（套用在 translation 欄位的內容上）
+1. 標題：遵守 H1→H2→H3 遞進，不跳級；`#` 與文字間留一個半形空格；內文從 H2/H3 開始。
+2. 間距：不同區塊之間只留一個空白行，不連續出現兩個以上空白行。
+3. 列表：無序列表統一用 `-`；有序列表用遞增數字；巢狀列表縮排 4 個半形空格。
+4. 強調：重點用 **粗體**；專有名詞/檔名/指令用 `反引號`；中英文字之間留一個半形空格。
+5. 程式碼區塊：三個反引號並標註語言（```python、```bash、```text）。
+6. 不使用 HTML 標籤（如 `<br>`），一律用原生 Markdown。
+7. 表格：每列前後都要有 `|`；`|` 與內容間留空格；表頭下方要有含對齊設定的分隔線；儲存格內不換行、不放列表。
+
+## 術語庫
+<glossary>
+{{glossary}}
+</glossary>
+
+請根據以上規則與術語庫，翻譯第 {{page}} 頁，並以結構化 JSON 格式回傳（translation / last_english_anchor / new_terms）。
+"""
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+_PROMPT_CACHE: Dict[str, Tuple[float, str]] = {}
+_PROMPT_WARNED: Set[str] = set()
+
+
+def default_prompt_path() -> Path:
+    return Path(__file__).resolve().with_name(PROMPT_FILE_NAME)
+
+
+def default_prompt_file_text() -> str:
+    """內建預設提示詞（含檔頭說明），用來建立或還原提示詞檔。"""
+    return PROMPT_FILE_HEADER + "\n" + DEFAULT_PROMPT_TEMPLATE
+
+
+def strip_prompt_comments(text: str) -> str:
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith(";;")).strip("\n") + "\n"
+
+
+def validate_prompt(template: str) -> List[str]:
+    """檢查提示詞，回傳警告訊息（空清單代表沒問題）。"""
+    warns = []
+    found = {m.group(1) for m in _PLACEHOLDER_RE.finditer(template)}
+    for key in PROMPT_REQUIRED:
+        if key not in found:
+            warns.append("缺少必要的變數 {{%s}}（%s）" % (key, PROMPT_PLACEHOLDERS[key]))
+    for key in sorted(found - set(PROMPT_PLACEHOLDERS)):
+        warns.append("不認得的變數 {{%s}}，翻譯時不會被替換" % key)
+    if not template.strip():
+        warns.append("提示詞是空的")
+    return warns
+
+
+def load_prompt_template(path: Optional[str] = None) -> Tuple[str, str]:
+    """讀取提示詞範本，回傳 (範本文字, 來源說明)。檔案不存在或讀取失敗就用內建預設。
+    以檔案修改時間快取；編輯後存檔，下一頁就會套用。"""
+    p = Path(path) if path else default_prompt_path()
+    try:
+        mtime = p.stat().st_mtime
+        cached = _PROMPT_CACHE.get(str(p))
+        if cached and cached[0] == mtime:
+            return cached[1], str(p)
+        text = strip_prompt_comments(p.read_text(encoding="utf-8"))
+        if not text.strip():
+            raise ValueError("檔案是空的")
+        _PROMPT_CACHE[str(p)] = (mtime, text)
+        return text, str(p)
+    except FileNotFoundError:
+        return DEFAULT_PROMPT_TEMPLATE, "內建預設"
+    except Exception as e:
+        if str(p) not in _PROMPT_WARNED:
+            _PROMPT_WARNED.add(str(p))
+            log.warning("讀取提示詞檔失敗（%s），改用內建預設：%s", e, p)
+        return DEFAULT_PROMPT_TEMPLATE, "內建預設"
+
+
+def render_prompt(template: str, values: Dict[str, str]) -> str:
+    return _PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), template)
 
 
 # ============================================================
@@ -578,6 +721,8 @@ class BookJob:
         self.router: ModelRouter = km.router
         self.active_model: Optional[str] = None
         self.no_thinking: Set[str] = set()  # 不支援 thinking 設定的模型
+        self.no_safety: Set[str] = set()    # 不接受 safety_settings 的模型
+        self.prompt_sig = ""                # 目前使用的提示詞指紋（記錄在每頁結果中）
 
     # ---------- 路徑 / 狀態 ----------
     def page_path(self, n: int) -> Path:
@@ -692,67 +837,59 @@ class BookJob:
             "若本頁從新段落或新標題開始，請忽略以上資訊。"
         )
 
-    def build_prompt(self, n: int) -> str:
+    def build_prompt(self, n: int, source_text: Optional[str] = None) -> str:
+        template, _src = load_prompt_template(self.cfg.prompt_file)
+        self.prompt_sig = hashlib.sha1(template.encode("utf-8")).hexdigest()[:8]
         prev_note = ""
-        if self.cfg.with_prev_page and n > 1:
+        if source_text is None and self.cfg.with_prev_page and n > 1:
             prev_note = f"\n注意：附上的第一份 PDF 是上一頁（第 {n - 1} 頁），僅供理解上下文，請勿翻譯；只翻譯第二份 PDF（第 {n} 頁）。\n"
-        glossary = json.dumps(self.relevant_glossary(n), ensure_ascii=False)
-        return f"""你是一位頂級的 TRPG 規則書譯者。請翻譯本頁 PDF 內容（第 {n} 頁）。{prev_note}
-
-【跨頁接續資訊】(最優先規則)
-{self._continuity(n)}
-
-## 翻譯規範
-1. 使用繁體中文與台灣 TRPG 慣用語（例：Saving Throw -> 豁免、Proficiency -> 熟練），不使用中國大陸用語。
-2. 稍後會提供一份術語庫，譯文中請直接使用對應的中文譯名；不要輸出 <glossary>、term= 等任何標籤代碼，譯文必須是純淨、可直接閱讀的中文。
-3. 以段落為單位翻譯，避免破碎句子。
-4. 忽略裝飾性圖片、頁首、頁尾、頁碼。
-5. new_terms 欄位只收錄具有長期參考價值的專有名詞：NPC/角色姓名、地名、重要場景物件、核心遊戲機制、角色屬性、關鍵物品、狀態效果。不收錄片語、諺語、句子，或已出現在術語庫中的詞彙；沒有符合條件的新術語就留空。
-
-## Markdown 排版規範（套用在 translation 欄位的內容上）
-1. 標題：遵守 H1→H2→H3 遞進，不跳級；`#` 與文字間留一個半形空格；內文從 H2/H3 開始。
-2. 間距：不同區塊之間只留一個空白行，不連續出現兩個以上空白行。
-3. 列表：無序列表統一用 `-`；有序列表用遞增數字；巢狀列表縮排 4 個半形空格。
-4. 強調：重點用 **粗體**；專有名詞/檔名/指令用 `反引號`；中英文字之間留一個半形空格。
-5. 程式碼區塊：三個反引號並標註語言（```python、```bash、```text）。
-6. 不使用 HTML 標籤（如 `<br>`），一律用原生 Markdown。
-7. 表格：每列前後都要有 `|`；`|` 與內容間留空格；表頭下方要有含對齊設定的分隔線；儲存格內不換行、不放列表。
-
-## 術語庫
-<glossary>
-{glossary}
-</glossary>
-
-請根據以上規則與術語庫，翻譯第 {n} 頁，並以結構化 JSON 格式回傳（translation / last_english_anchor / new_terms）。
-"""
+        values = {
+            "page": str(n),
+            "prev_note": prev_note,
+            "continuity": self._continuity(n),
+            "glossary": json.dumps(self.relevant_glossary(n), ensure_ascii=False),
+        }
+        prompt = render_prompt(template, values)
+        if source_text is not None:  # 純文字模式：沒有附 PDF
+            prompt += (f"\n\n【本頁來源改為純文字】這次沒有附 PDF。以下是從 PDF 抽取的第 {n} 頁原文"
+                       f"（版面可能散亂，表格與欄位順序可能錯亂，請依內容合理整理）：\n"
+                       f"<page_text>\n{source_text}\n</page_text>\n")
+        return prompt
 
     # ---------- 呼叫模型 ----------
-    def call_model(self, n: int, model: str):
+    def call_model(self, n: int, model: str, mode: str = "pdf"):
         self.last_upload_s = 0.0
         self.last_gen_s = 0.0
         parts, cleanup = [], []
         try:
-            pages = [n - 1, n] if (self.cfg.with_prev_page and n > 1) else [n]
-            for p in pages:
-                data = self.page_bytes(p)
-                if self.cfg.transport == "inline" and len(data) <= INLINE_LIMIT:
-                    parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
-                else:
-                    t_up = time.time()
-                    client, f = self._upload_pdf(data)
-                    self.last_upload_s += time.time() - t_up
-                    parts.append(f)
-                    cleanup.append((client, f.name))
+            if mode == "text":  # 被安全機制攔截時的備援：只送抽取出的文字，不送頁面圖片
+                contents = [self.build_prompt(n, source_text=self.page_text(n)[:30000])]
+            else:
+                pages = [n - 1, n] if (self.cfg.with_prev_page and n > 1) else [n]
+                for p in pages:
+                    data = self.page_bytes(p)
+                    if self.cfg.transport == "inline" and len(data) <= INLINE_LIMIT:
+                        parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
+                    else:
+                        t_up = time.time()
+                        client, f = self._upload_pdf(data)
+                        self.last_upload_s += time.time() - t_up
+                        parts.append(f)
+                        cleanup.append((client, f.name))
+                contents = [*parts, self.build_prompt(n)]
 
             kwargs = dict(response_mime_type="application/json", response_schema=PageTranslation)
             if (self.cfg.thinking and self.cfg.thinking.lower() not in ("none", "default")
                     and model not in self.no_thinking):
                 kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=self.cfg.thinking)
+            if self.cfg.relax_safety and model not in self.no_safety:
+                kwargs["safety_settings"] = [types.SafetySetting(category=c, threshold="BLOCK_NONE")
+                                             for c in SAFETY_CATEGORIES]
 
             t_gen = time.time()
             resp = self.km.client.models.generate_content(
                 model=model,
-                contents=[*parts, self.build_prompt(n)],
+                contents=contents,
                 config=types.GenerateContentConfig(**kwargs),
             )
             self.last_gen_s = time.time() - t_gen
@@ -764,7 +901,7 @@ class BookJob:
                 except Exception:
                     pass
 
-    def commit_page(self, n: int, result: PageTranslation, usage, model: str) -> None:
+    def commit_page(self, n: int, result: PageTranslation, usage, model: str, mode: str = "pdf") -> None:
         # 先存術語庫再存頁面：中途當機時，重做該頁是安全的（術語不會重複覆蓋）
         added = self.add_terms(result.new_terms)
         if added:
@@ -777,6 +914,8 @@ class BookJob:
             "last_english_anchor": result.last_english_anchor.strip(),
             "new_terms": [t.model_dump() for t in result.new_terms],
             "model": model,
+            "source": mode,
+            "prompt": self.prompt_sig,
             "key_id": self.km.ids[self.km.index],
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
@@ -819,6 +958,19 @@ class BookJob:
                 return None
         return None
 
+    def _next_block_attempt(self, n: int, tried) -> Optional[Tuple[str, str]]:
+        """被安全機制攔截後，挑下一個要嘗試的（模型, 模式）。順序：主模型 PDF → 主模型純文字 →
+        （若啟用自動切換）備援模型 PDF → 備援模型純文字。最多嘗試 block_max_attempts 種。"""
+        if len(tried) >= self.cfg.block_max_attempts:
+            return None
+        text_ok = self.cfg.text_fallback and len(self.page_text(n).strip()) >= 40
+        r = self.router
+        for m in (r.chain if r.enabled else [r.primary]):
+            for mode in (["pdf", "text"] if text_ok else ["pdf"]):
+                if (m, mode) not in tried:
+                    return (m, mode)
+        return None
+
     def _on_congestion(self, model: str) -> bool:
         """記一次伺服器端錯誤；若因此判定塞車且有其他模型可用，回傳 True（呼叫端應立刻換模型重試）。"""
         r = self.router
@@ -837,18 +989,31 @@ class BookJob:
         cfg, km, r = self.cfg, self.km, self.router
         fails = rate_hits = switches = 0
         last_err = ""
+        forced: Optional[Tuple[str, str]] = None   # 被攔截後指定的（模型, 模式）
+        tried: Set[Tuple[str, str]] = set()
         while True:
             if STOP.is_set() or not self.alive():
                 return "stopped"
-            model = self.choose_model()
-            if model is None or not self.alive():
-                return "stopped"
+            model = mode = None
+            if forced is not None:
+                if km.use_ready(forced[0]):
+                    model, mode = forced
+                else:  # 這個組合的 Key 暫時都在冷卻：視為已嘗試，換下一個
+                    tried.add(forced)
+                    forced = self._next_block_attempt(n, tried)
+                    if forced is None:
+                        return self.mark_failed(n, f"{last_err}（已嘗試各種備援方式）")
+                    continue
+            if model is None:
+                model, mode = self.choose_model(), "pdf"
+                if model is None or not self.alive():
+                    return "stopped"
             km.wait_turn(cfg.min_interval)
             if STOP.is_set() or not self.alive():
                 return "stopped"
             t0 = time.time()
             try:
-                result, usage = self.call_model(n, model)
+                result, usage = self.call_model(n, model, mode)
             except FatalError:
                 raise
             except errors.ClientError as e:
@@ -866,6 +1031,10 @@ class BookJob:
                 if code == 400 and "thinking" in str(e).lower() and model not in self.no_thinking:
                     self.no_thinking.add(model)
                     log.warning("⚠️ 模型 %s 不支援目前的思考強度設定，改為不指定思考強度後重試", model)
+                    continue
+                if code == 400 and "safety" in str(e).lower() and model not in self.no_safety:
+                    self.no_safety.add(model)
+                    log.warning("⚠️ 模型 %s 不接受安全過濾設定，改為不指定後重試", model)
                     continue
                 if code == 404:
                     if r.enabled and r.has_other(model):
@@ -886,6 +1055,16 @@ class BookJob:
                         return self.mark_failed(n, f"各模型都持續塞車：{last_err}")
                     fails = 0  # 換了模型，重新計算這一頁的重試次數
                     continue
+            except BlockedResponse as e:
+                last_err = f"被安全機制攔截：{e.reason}"
+                log.warning("🛡️ 第 %d 頁被 Google 安全機制攔截（%s｜模型 %s｜%s）", n, e.reason, model,
+                            "純文字模式" if mode == "text" else "PDF 模式")
+                tried.add((model, mode))
+                forced = self._next_block_attempt(n, tried)
+                if forced is None:
+                    return self.mark_failed(n, f"{last_err}（已嘗試 {len(tried)} 種方式）")
+                log.info("🔁 第 %d 頁改用：%s｜%s", n, forced[0], "純文字模式" if forced[1] == "text" else "PDF 模式")
+                continue
             except (EmptyResponse, ValueError) as e:  # ValueError 涵蓋 pydantic ValidationError
                 fails += 1
                 last_err = f"{type(e).__name__}: {str(e)[:200]}"
@@ -902,9 +1081,9 @@ class BookJob:
                 if not self.alive():  # 強制停止後才回來的結果：直接丟棄
                     return "stopped"
                 r.record_ok(model)
-                self.commit_page(n, result, usage, model)
-                log.info("✅ 第 %d 頁完成（%s｜總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, model,
-                         time.time() - t0, self.last_upload_s, self.last_gen_s,
+                self.commit_page(n, result, usage, model, mode)
+                log.info("✅ 第 %d 頁完成（%s%s｜總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, model,
+                         "｜純文字模式" if mode == "text" else "", time.time() - t0, self.last_upload_s, self.last_gen_s,
                          getattr(usage, "prompt_token_count", "?"), getattr(usage, "candidates_token_count", "?"),
                          getattr(usage, "thoughts_token_count", "?"))
                 return "ok"
@@ -942,6 +1121,8 @@ class BookJob:
         log.info("📖 [%s] 共 %d 頁，本次範圍 %d~%d", self.name, self.total, start, end)
         if self.router.enabled:
             log.info("🔀 自動切換模型已啟用：%s", " → ".join(self.router.chain))
+        _tpl, _src = load_prompt_template(cfg.prompt_file)
+        log.info("📝 系統提示詞：%s（指紋 %s）", _src, hashlib.sha1(_tpl.encode("utf-8")).hexdigest()[:8])
 
         consecutive = 0
         aborted = False
@@ -1048,6 +1229,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="同一模型連續幾次伺服器錯誤就判定塞車")
     p.add_argument("--recover-minutes", type=int, default=Config.recover_minutes,
                    help="判定塞車後，隔幾分鐘再回頭試優先順序較前的模型")
+    p.add_argument("--prompt-file", default="", help=f"系統提示詞檔（預設：引擎同資料夾的 {PROMPT_FILE_NAME}；不存在就用內建預設）")
+    p.add_argument("--write-default-prompt", action="store_true", help="把內建預設提示詞寫成檔案（已存在則不覆蓋）後離開")
+    p.add_argument("--no-relax-safety", action="store_true", help="不放寬可調整的安全過濾")
+    p.add_argument("--no-text-fallback", action="store_true", help="被安全機制攔截時，不改用純文字重試")
     p.add_argument("--max-fails", type=int, default=Config.max_fails)
     p.add_argument("--max-consecutive-fails", type=int, default=Config.max_consecutive_fails)
     p.add_argument("--with-prev-page", action="store_true", help="額外附上上一頁 PDF 當上下文（約 2 倍成本）")
@@ -1075,6 +1260,14 @@ def resolve_pdfs(patterns: Optional[List[str]]) -> List[Path]:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.write_default_prompt:
+        target = Path(args.prompt_file) if args.prompt_file else default_prompt_path()
+        if target.exists():
+            print(f"已存在，未覆蓋：{target}")
+        else:
+            write_text_atomic(target, default_prompt_file_text())
+            print(f"已建立：{target}")
+        return 0
     setup_logging()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -1085,6 +1278,8 @@ def main(argv=None) -> int:
         timeout=args.timeout, transport=args.transport, with_prev_page=args.with_prev_page,
         auto_switch=args.auto_switch, congest_threshold=args.congest_threshold,
         recover_minutes=args.recover_minutes,
+        prompt_file=args.prompt_file, relax_safety=not args.no_relax_safety,
+        text_fallback=not args.no_text_fallback,
         fallback_models=[m.strip() for m in args.fallback_models.split(",") if m.strip()],
         page_markers=args.page_markers, join_pages=not args.no_join,
         redo=parse_page_spec(args.redo) if args.redo else set(),

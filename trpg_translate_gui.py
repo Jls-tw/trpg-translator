@@ -65,6 +65,7 @@ except Exception:
     TRAY_AVAILABLE = False
 
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
+PROMPT_FILE = APP_DIR / engine.PROMPT_FILE_NAME   # 系統提示詞（獨立檔案，可在介面中檢視 / 編輯）
 APP_VERSION = getattr(engine, "__version__", "2.6.0")
 DEFAULT_FALLBACKS = "gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite"
 DARK = {  # 深色模式配色
@@ -266,6 +267,8 @@ class App:
         self.file_handler: Optional[logging.Handler] = None
         self.tray_icon = None
         self.grips: List[tk.Widget] = []
+        self.list_min = LIST_MIN      # PDF 清單的最小高度（版面建好後依右側按鈕高度重算）
+        self._prompt_win = None
         self._idle_windows = 0       # 連續幾個排程時段沒有任何進展
         self._window_done0 = 0       # 本時段開始時的已完成頁數
         self._had_fatal = False
@@ -341,6 +344,9 @@ class App:
         # 視窗選項
         self.dark_var = tk.BooleanVar(value=False)
         self.tray_var = tk.BooleanVar(value=False)
+        # 內容攔截
+        self.relax_var = tk.BooleanVar(value=True)
+        self.textfb_var = tk.BooleanVar(value=True)
 
     # ---------- 介面 ----------
     def _build_ui(self) -> None:
@@ -380,6 +386,7 @@ class App:
 
         btns = ttk.Frame(box)
         btns.grid(row=0, column=2, sticky="ns", padx=(10, 0))
+        self.list_btns_frame = btns
         self.list_buttons = [
             ttk.Button(btns, text="新增 PDF…", command=self.on_add_files),
             ttk.Button(btns, text="新增資料夾…", command=self.on_add_folder),
@@ -437,6 +444,13 @@ class App:
             cb = ttk.Checkbutton(sf, text=text, variable=var)
             cb.grid(row=8 + i, column=0, columnspan=4, sticky="w", pady=1)
             self.settings_widgets.append(cb)
+        self.relax_cb = ttk.Checkbutton(sf, text="放寬可調整的安全過濾（成人向 / 恐怖 / 暴力等虛構內容）", variable=self.relax_var)
+        self.relax_cb.grid(row=12, column=0, columnspan=4, sticky="w", pady=1)
+        self.textfb_cb = ttk.Checkbutton(sf, text="被安全機制攔截時，改用純文字重試", variable=self.textfb_var)
+        self.textfb_cb.grid(row=13, column=0, columnspan=4, sticky="w", pady=1)
+        self.settings_widgets += [self.relax_cb, self.textfb_cb]
+        self.prompt_btn = ttk.Button(sf, text="檢視 / 編輯系統提示詞…", command=self.on_edit_prompt)
+        self.prompt_btn.grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right = ttk.Frame(mid)
         right.grid(row=0, column=1, sticky="nsew")
@@ -531,13 +545,20 @@ class App:
         self.theme_btn.grid(row=0, column=2, padx=(0, 6), pady=2)
 
     def _init_layout(self) -> None:
-        """依實際內容決定視窗初始高度與最小高度。"""
+        """依實際內容決定視窗初始高度與最小高度；PDF 清單的最小高度必須能完整顯示右側按鈕。"""
         try:
             self.root.update_idletasks()
-            req_h = self.root.winfo_reqheight()
-            fixed = req_h - LIST_H0 - LOG_H0  # 設定、操作列、進度、狀態列等固定區塊的總高度
-            self.root.minsize(920, fixed + LIST_MIN + LOG_MIN)
-            self.root.geometry(f"1020x{min(req_h, self.root.winfo_screenheight() - 90)}")
+            btn_h = int(self.list_btns_frame.winfo_reqheight())
+            self.list_min = max(LIST_MIN, btn_h + 44)  # 44 = 框線、標題與內距
+            list_h = max(LIST_H0, self.list_min)
+            self.list_frame.configure(height=list_h)
+            self.root.rowconfigure(0, minsize=self.list_min + 10)  # +10 = 清單上方的留白
+            self.root.rowconfigure(5, minsize=LOG_MIN)
+            self.root.update_idletasks()
+            req_h = int(self.root.winfo_reqheight())
+            fixed = req_h - list_h - LOG_H0  # 設定、操作列、進度、狀態列等固定區塊的總高度
+            self.root.minsize(920, fixed + self.list_min + LOG_MIN)
+            self.root.geometry(f"1020x{min(req_h, int(self.root.winfo_screenheight()) - 90)}")
         except tk.TclError:
             pass
 
@@ -565,7 +586,7 @@ class App:
         d = self._drag
         if not d:
             return
-        min_h = LIST_MIN if d["which"] == "list" else LOG_MIN
+        min_h = self.list_min if d["which"] == "list" else LOG_MIN
         want = d["h0"] + (event.y_root - d["y0"])
         delta = max(want, min_h) - d["h0"]
         win_lo = int(self.root.minsize()[1])
@@ -601,7 +622,8 @@ class App:
                        ("markers", self.markers_var), ("move", self.move_var),
                        ("sched_start_on", self.sched_start_on), ("sched_end_on", self.sched_end_on),
                        ("auto", self.auto_var),
-                       ("dark", self.dark_var), ("tray", self.tray_var)):
+                       ("dark", self.dark_var), ("tray", self.tray_var),
+                       ("relax", self.relax_var), ("textfb", self.textfb_var)):
             if k in data:
                 var.set(bool(data[k]))
         for p in data.get("pdfs", []):
@@ -622,6 +644,7 @@ class App:
             "auto": self.auto_var.get(), "fallback": self.fallback_var.get(),
             "congest": self.congest_var.get(), "recover": self.recover_var.get(),
             "dark": self.dark_var.get(), "tray": self.tray_var.get(),
+            "relax": self.relax_var.get(), "textfb": self.textfb_var.get(),
             "pdfs": [str(b["path"]) for b in self.books.values()],
         }
         try:
@@ -923,6 +946,99 @@ class App:
         except Exception:
             pass
 
+    # ---------- 系統提示詞編輯器 ----------
+    def on_edit_prompt(self) -> None:
+        old = self._prompt_win
+        try:
+            if old is not None and old.winfo_exists():
+                old.lift()
+                old.focus_force()
+                return
+        except tk.TclError:
+            pass
+        exists = PROMPT_FILE.exists()
+        try:
+            initial = PROMPT_FILE.read_text(encoding="utf-8") if exists else engine.default_prompt_file_text()
+        except Exception as e:
+            messagebox.showerror("無法讀取提示詞檔", f"{PROMPT_FILE}\n\n{e}")
+            return
+
+        win = tk.Toplevel(self.root)
+        self._prompt_win = win
+        win.title("系統提示詞")
+        win.geometry("900x680")
+        win.minsize(640, 420)
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(2, weight=1)
+        note = "" if exists else "（尚未建立；目前顯示內建預設，按「儲存」才會建立檔案）"
+        ttk.Label(win, text=f"檔案：{PROMPT_FILE}{note}", wraplength=860, justify="left").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        helptext = ("可用變數（每一頁翻譯時自動替換）：\n" +
+                    "\n".join(f"  {{{{{k}}}}}  {v}" for k, v in engine.PROMPT_PLACEHOLDERS.items()) +
+                    "\n以「;;」開頭的行是註解。儲存後，下一頁翻譯就會套用，不需要重新啟動。")
+        ttk.Label(win, text=helptext, justify="left").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+        txt = ScrolledText(win, wrap="word", undo=True, font=self.log_font)
+        txt.grid(row=2, column=0, sticky="nsew", padx=12)
+        txt.insert("1.0", initial)
+        txt.edit_reset()
+        self._style_dialog(win, txt)
+        status = tk.StringVar(value="")
+        ttk.Label(win, textvariable=status).grid(row=3, column=0, sticky="w", padx=12, pady=(6, 0))
+        bar = ttk.Frame(win)
+        bar.grid(row=4, column=0, sticky="ew", padx=12, pady=10)
+        state = {"saved": initial}
+
+        def current() -> str:
+            return txt.get("1.0", "end-1c")
+
+        def save() -> bool:
+            body = current()
+            warns = engine.validate_prompt(engine.strip_prompt_comments(body))
+            if warns and not messagebox.askyesno(
+                    "提示詞可能有問題", "\n".join("• " + w for w in warns) + "\n\n仍要儲存嗎？", parent=win):
+                return False
+            try:
+                engine.write_text_atomic(PROMPT_FILE, body if body.endswith("\n") else body + "\n")
+            except Exception as e:
+                messagebox.showerror("儲存失敗", str(e), parent=win)
+                return False
+            state["saved"] = body
+            status.set("已儲存。下一頁翻譯起套用" + ("（進行中的這一頁不受影響）。" if self.running else "。"))
+            return True
+
+        def restore() -> None:
+            if not messagebox.askyesno("還原預設值",
+                                       "要把內容換回內建預設提示詞嗎？\n（按「儲存」之前不會改動檔案）", parent=win):
+                return
+            txt.delete("1.0", "end")
+            txt.insert("1.0", engine.default_prompt_file_text())
+            status.set("已載入內建預設（尚未儲存）。")
+
+        def open_external() -> None:
+            if not PROMPT_FILE.exists() or current() != state["saved"]:
+                if not save():
+                    return
+            open_path(PROMPT_FILE)
+
+        def close() -> None:
+            if current() != state["saved"]:
+                ans = messagebox.askyesnocancel("尚未儲存", "內容已修改，要儲存嗎？", parent=win)
+                if ans is None:
+                    return
+                if ans and not save():
+                    return
+            self._prompt_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        ttk.Button(bar, text="關閉", command=close).pack(side="right")
+        ttk.Button(bar, text="用外部編輯器開啟", command=open_external).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="還原預設值", command=restore).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="儲存", command=save).pack(side="right", padx=(0, 6))
+        self._prompt_dialog = {"save": save, "restore": restore, "close": close, "text": txt,
+                               "state": state, "status": status, "open_external": open_external}
+
     # ---------- 失敗頁碼摘要 ----------
     @staticmethod
     def _fmt_pages(pages) -> str:
@@ -944,10 +1060,17 @@ class App:
                 continue
             folder = self.out_root(b["path"]) / b["name"]
             data = engine.load_json(folder / "failed_pages.json", {})
-            pages = [int(k) for k in data.get("pages", {}) if str(k).isdigit()]
+            reasons = data.get("pages", {})
+            pages = [int(k) for k in reasons if str(k).isdigit()]
             if pages:
                 engine.log.warning("[%s] 失敗的頁碼：%s（共 %d 頁）。再按一次「開始翻譯」會自動重試這些頁。",
                                    b["name"], self._fmt_pages(pages), len(pages))
+                blocked = [int(k) for k, v in reasons.items() if str(k).isdigit() and "被安全機制攔截" in str(v)]
+                if blocked:
+                    engine.log.warning(
+                        "[%s] 其中第 %s 頁是被 Google 安全機制攔截（如 PROHIBITED_CONTENT）。"
+                        "可確認「被攔截時改用純文字重試」已勾選、設定備援模型，或改為手動翻譯這幾頁。",
+                        b["name"], self._fmt_pages(blocked))
             else:
                 engine.log.info("[%s] 沒有失敗的頁面。", b["name"])
 
@@ -983,6 +1106,11 @@ class App:
         tip(self.model_combo, "免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。\n"
                               "也可直接輸入其他型號名稱。")
         tip(self.auto_cb, "同一模型連續出現 503 / 504 / 逾時就判定塞車，改用備援模型；額度用完時也會切換。")
+        tip(self.relax_cb, "把 Google 官方「可調整」的安全類別（騷擾、仇恨、性內容、危險內容）設為不攔截，"
+                           "適合成人向的虛構內容。\n注意：PROHIBITED_CONTENT 這類核心保護不受這個設定影響。")
+        tip(self.textfb_cb, "整頁被攔截時，改成只送抽取出的文字（不附頁面圖片）再試一次。\n"
+                            "插圖被誤判時特別有用；若原文文字本身被攔截則無效。")
+        tip(self.prompt_btn, "系統提示詞存放在獨立檔案，可在這裡檢視與修改；儲存後下一頁翻譯就會套用。")
         tip(self.out_entry, "譯文與進度會存在此資料夾下的「書名」子資料夾。")
         for w in self.sched_widgets:
             Tooltip(w, self._sched_tip_text, self._tip_colors)
@@ -1018,6 +1146,9 @@ class App:
                 page_markers=self.markers_var.get(),
                 join_pages=self.join_var.get(),
                 move_pdf=self.move_var.get(),
+                relax_safety=self.relax_var.get(),
+                text_fallback=self.textfb_var.get(),
+                prompt_file=str(PROMPT_FILE),
                 auto_switch=self.auto_var.get(),
                 fallback_models=[m for m in re.split(r"[,;\s]+", self.fallback_var.get()) if m],
                 congest_threshold=self._num(self.congest_var, "塞車判定次數", 1, 20),
