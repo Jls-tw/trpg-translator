@@ -25,7 +25,7 @@ TRPG 規則書 PDF 逐頁翻譯工具 v2
 """
 from __future__ import annotations
 
-__version__ = "2.7.0"
+__version__ = "2.9.0"
 
 import argparse
 import datetime
@@ -98,6 +98,16 @@ class PageTranslation(BaseModel):
         default_factory=list,
         description="符合收錄準則的新術語列表；若無新術語請回傳空陣列",
     )
+    translatable: bool = Field(
+        default=True,
+        description="本頁是否有需要翻譯的文字。若本頁只有插圖、照片、花紋、Logo、頁碼或空白，沒有任何需要翻譯的文字，"
+                    "請填 false 並讓 translation 留空；只要有任何可閱讀的內文（包含圖片中的文字）就填 true",
+    )
+
+
+class PageTriage(BaseModel):
+    translatable: bool = Field(description="這一頁是否含有需要翻譯的文字")
+    reason: str = Field(default="", description="10 字以內的理由")
 
 
 class FatalError(Exception):
@@ -136,6 +146,9 @@ class Config:
     page_markers: bool = False       # 合併檔每頁前加 <!-- p.N --> 註解
     join_pages: bool = True          # 合併時嘗試接回被分頁切斷的段落
     glossary_warn: int = 500
+    image_page_mode: str = "auto"    # 抽不出文字的頁面：auto = 自動判斷是否純插圖（純插圖略過）/ translate = 全部翻譯 / skip = 全部略過
+    triage_model: str = ""           # 判斷「是否純插圖」用的模型；空 = 優先用備援清單中的 Flash-Lite，沒有就用主要模型
+    glossary_textless_cap: int = 120  # 純圖片頁（抽不出文字、無法過濾術語庫）最多帶入幾條術語；0 = 不帶
     output_root: str = "."           # 輸出資料夾的上層目錄（GUI 使用；CLI 預設為目前資料夾）
     move_pdf: bool = True            # 全部完成後是否把原始 PDF 移進輸出資料夾
     # --- 自動切換模型 ---
@@ -494,7 +507,7 @@ def _enum_name(x) -> str:
     return str(name if name else x).split(".")[-1].strip()
 
 
-def parse_response(resp) -> PageTranslation:
+def parse_response(resp, schema=None):
     text = ""
     try:
         text = (getattr(resp, "text", None) or "").strip()
@@ -515,12 +528,16 @@ def parse_response(resp) -> PageTranslation:
             raise BlockedResponse(reason, f"被安全機制攔截 (finish_reason={fin or '-'}, block_reason={blk or '-'})")
     if not text:
         raise EmptyResponse(f"空回應 (finish_reason={fin or '-'}, block_reason={blk or '-'})")
-    return PageTranslation.model_validate_json(text)
+    return (schema or PageTranslation).model_validate_json(text)
 
 
 # ============================================================
 # 系統提示詞（存放在獨立檔案，可由使用者修改）
 # ============================================================
+TRIAGE_PROMPT = """請判斷這一頁是否含有「需要翻譯的文字」。
+需要翻譯：成段的文字、標題、表格、圖說、對白、數值欄位、說明標示等任何可閱讀的內文（包含圖片裡的文字）。
+不需要翻譯：純插圖、照片、花紋或背景裝飾、Logo、只有頁碼或頁首頁尾、空白頁。
+只回傳 JSON：{"translatable": true 或 false, "reason": "10 字以內的理由"}"""
 PROMPT_FILE_NAME = "system_prompt.txt"
 PROMPT_PLACEHOLDERS = {
     "page": "目前頁碼",
@@ -553,7 +570,7 @@ DEFAULT_PROMPT_TEMPLATE = r"""你是一位頂級的 TRPG 規則書譯者。請�
 1. 使用繁體中文與台灣 TRPG 慣用語（例：Saving Throw -> 豁免、Proficiency -> 熟練），不使用中國大陸用語。
 2. 稍後會提供一份術語庫，譯文中請直接使用對應的中文譯名；不要輸出 <glossary>、term= 等任何標籤代碼，譯文必須是純淨、可直接閱讀的中文。
 3. 以段落為單位翻譯，避免破碎句子。
-4. 忽略裝飾性圖片、頁首、頁尾、頁碼。
+4. 忽略裝飾性圖片、頁首、頁尾、頁碼。若本頁沒有任何需要翻譯的文字（只有插圖、照片、花紋、Logo、頁碼或空白），translatable 請填 false、translation 留空；只要有可閱讀的內文就填 true。
 5. new_terms 欄位只收錄具有長期參考價值的專有名詞：NPC/角色姓名、地名、重要場景物件、核心遊戲機制、角色屬性、關鍵物品、狀態效果。不收錄片語、諺語、句子，或已出現在術語庫中的詞彙；沒有符合條件的新術語就留空。
 
 ## Markdown 排版規範（套用在 translation 欄位的內容上）
@@ -723,6 +740,8 @@ class BookJob:
         self.no_thinking: Set[str] = set()  # 不支援 thinking 設定的模型
         self.no_safety: Set[str] = set()    # 不接受 safety_settings 的模型
         self.prompt_sig = ""                # 目前使用的提示詞指紋（記錄在每頁結果中）
+        self.scanned_book = False           # 抽樣判斷：是否為掃描型 PDF（大多數頁面抽不出文字）
+        self.skipped: List[int] = []        # 本輪判定為純插圖而略過的頁碼
 
     # ---------- 路徑 / 狀態 ----------
     def page_path(self, n: int) -> Path:
@@ -791,15 +810,52 @@ class BookJob:
 
     # ---------- 術語庫 ----------
     def relevant_glossary(self, n: int) -> Dict[str, str]:
-        """只帶入本頁文字中實際出現的術語；掃描檔（抽不出文字）則帶入全部。"""
+        """只帶入「用得到」的術語，避免把整份術語庫塞進每一頁（浪費 token）。
+        有文字的頁面：本頁原文中實際出現的術語。
+        純圖片頁（抽不出文字）：改看鄰近頁原文與近期譯文，並限制在 glossary_textless_cap 條以內。"""
         text = self.page_text(n)
-        if len(text.strip()) < 20:
-            if len(self.glossary) > self.cfg.glossary_warn and not self._warned_full_glossary:
-                log.warning("本頁無可抽取文字，無法過濾術語庫，將帶入全部 %d 條（token 成本較高）", len(self.glossary))
-                self._warned_full_glossary = True
-            return self.glossary
-        low = re.sub(r"\s+", " ", text.lower())
-        return {k: v for k, v in self.glossary.items() if k.lower() in low}
+        if len(text.strip()) >= 20:
+            low = re.sub(r"\s+", " ", text.lower())
+            return {k: v for k, v in self.glossary.items() if k.lower() in low}
+        return self._glossary_textless(n)
+
+    def _glossary_textless(self, n: int) -> Dict[str, str]:
+        total = len(self.glossary)
+        cap = max(0, int(self.cfg.glossary_textless_cap))
+        if total == 0:
+            return {}
+        if cap == 0:
+            log.info("📎 第 %d 頁無可抽取文字（純圖片頁）：不帶入術語庫（上限設為 0）", n)
+            return {}
+        picked: Dict[str, str] = {}
+        # 1) 前後各 2 頁的原文中出現過的術語
+        near = re.sub(r"\s+", " ", " ".join(self.page_text(i) for i in range(n - 2, n + 3) if i != n).lower())
+        if near.strip():
+            for k, v in self.glossary.items():
+                if k.lower() in near:
+                    picked[k] = v
+        n_near = len(picked)
+        # 2) 前 3 頁譯文已經用到的中文譯名（整本都是掃描檔時，靠這個一路延續）
+        recent = "".join(load_json(self.page_path(i), {}).get("translation", "") for i in range(max(1, n - 3), n))
+        if recent:
+            for k, v in self.glossary.items():
+                if k not in picked and len(v) >= 2 and v in recent:
+                    picked[k] = v
+        n_recent = len(picked) - n_near
+        # 3) 太少時，補上最近新增的術語（通常是正在出場的人名、地名）
+        before = len(picked)
+        fill_to = min(cap, 40)
+        if len(picked) < fill_to:
+            for k, v in reversed(list(self.glossary.items())):
+                if len(picked) >= fill_to:
+                    break
+                picked.setdefault(k, v)
+        n_fill = len(picked) - before
+        result = dict(list(picked.items())[:cap])
+        log.info("📎 第 %d 頁無可抽取文字（純圖片頁）：術語庫改為帶入 %d / %d 條"
+                 "（鄰近頁原文 %d、近期譯文 %d、最近新增 %d；上限 %d）",
+                 n, len(result), total, n_near, n_recent, n_fill, cap)
+        return result
 
     def add_terms(self, terms: List[TermEntry]) -> int:
         added = 0
@@ -857,6 +913,19 @@ class BookJob:
         return prompt
 
     # ---------- 呼叫模型 ----------
+    def _build_parts(self, pages: List[int], parts: list, cleanup: list) -> None:
+        """把指定頁面做成要送給模型的 PDF 內容（inline 或先上傳 Files API）。"""
+        for p in pages:
+            data = self.page_bytes(p)
+            if self.cfg.transport == "inline" and len(data) <= INLINE_LIMIT:
+                parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
+            else:
+                t_up = time.time()
+                client, f = self._upload_pdf(data)
+                self.last_upload_s += time.time() - t_up
+                parts.append(f)
+                cleanup.append((client, f.name))
+
     def call_model(self, n: int, model: str, mode: str = "pdf"):
         self.last_upload_s = 0.0
         self.last_gen_s = 0.0
@@ -866,16 +935,7 @@ class BookJob:
                 contents = [self.build_prompt(n, source_text=self.page_text(n)[:30000])]
             else:
                 pages = [n - 1, n] if (self.cfg.with_prev_page and n > 1) else [n]
-                for p in pages:
-                    data = self.page_bytes(p)
-                    if self.cfg.transport == "inline" and len(data) <= INLINE_LIMIT:
-                        parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
-                    else:
-                        t_up = time.time()
-                        client, f = self._upload_pdf(data)
-                        self.last_upload_s += time.time() - t_up
-                        parts.append(f)
-                        cleanup.append((client, f.name))
+                self._build_parts(pages, parts, cleanup)
                 contents = [*parts, self.build_prompt(n)]
 
             kwargs = dict(response_mime_type="application/json", response_schema=PageTranslation)
@@ -907,7 +967,7 @@ class BookJob:
         if added:
             save_json(self.glossary_path, self.glossary)
             if len(self.glossary) > self.cfg.glossary_warn:
-                log.info("💡 術語庫已有 %d 條；已改為只帶入本頁相關術語，成本影響有限", len(self.glossary))
+                log.info("💡 術語庫已有 %d 條；有文字的頁面只帶入本頁相關術語，純圖片頁最多帶入 %d 條", len(self.glossary), self.cfg.glossary_textless_cap)
         save_json(self.page_path(n), {
             "page": n,
             "translation": result.translation.strip(),
@@ -971,6 +1031,97 @@ class BookJob:
                     return (m, mode)
         return None
 
+    # ---------- 純圖片頁判斷 ----------
+    def _estimate_scanned(self) -> None:
+        """抽樣最多 20 頁看有多少頁抽得出文字：多數抽不出來 = 掃描型 PDF。"""
+        k = min(20, self.total)
+        idxs = sorted({1 + int(i * (self.total - 1) / max(k - 1, 1)) for i in range(k)})
+        texty = sum(1 for n in idxs if len(self.page_text(n).strip()) >= 20)
+        ratio = texty / len(idxs)
+        self.scanned_book = ratio < 0.5
+        log.info("🧾 抽樣 %d 頁：%d 頁抽得出文字 → 判定為「%s」", len(idxs), texty,
+                 "掃描型 PDF（圖片頁直接翻譯，由模型順便判斷是否純插圖）" if self.scanned_book
+                 else "文字型 PDF（抽不出文字的頁面先用輕量模型判斷是否純插圖）")
+
+    def _triage_model(self) -> str:
+        if self.cfg.triage_model:
+            return self.cfg.triage_model
+        for m in [self.cfg.model, *self.cfg.fallback_models]:
+            if "lite" in m.lower():
+                return m
+        return self.cfg.model
+
+    def _write_skipped(self, n: int, reason: str, via: str, model: str = "") -> None:
+        save_json(self.page_path(n), {
+            "page": n, "translation": "", "skipped": "illustration", "reason": reason, "via": via,
+            "model": model, "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+        self._record_failed(n, None)
+        self.skipped.append(n)
+
+    def _probe_page(self, n: int) -> Optional[bool]:
+        """用輕量模型快速判斷：這一頁是否含有需要翻譯的文字。
+        回傳 True = 要翻譯、False = 純插圖（可略過）、None = 無法判斷（照常翻譯）。"""
+        model = self._triage_model()
+        km = self.km
+        if not km.use_ready(model):
+            return None
+        parts, cleanup = [], []
+        try:
+            self._build_parts([n], parts, cleanup)
+            kwargs = dict(response_mime_type="application/json", response_schema=PageTriage,
+                          max_output_tokens=120)
+            if self.cfg.relax_safety and model not in self.no_safety:
+                kwargs["safety_settings"] = [types.SafetySetting(category=c, threshold="BLOCK_NONE")
+                                             for c in SAFETY_CATEGORIES]
+            km.wait_turn(self.cfg.min_interval)
+            t0 = time.time()
+            resp = km.client.models.generate_content(
+                model=model, contents=[*parts, TRIAGE_PROMPT], config=types.GenerateContentConfig(**kwargs))
+            result = parse_response(resp, PageTriage)
+            usage = getattr(resp, "usage_metadata", None)
+            self.tokens_in += getattr(usage, "prompt_token_count", 0) or 0
+            self.tokens_out += getattr(usage, "candidates_token_count", 0) or 0
+            if model in self.router.chain:
+                self.router.record_ok(model)
+            if not self.alive():
+                return None
+            if result.translatable:
+                log.info("📄 第 %d 頁無可抽取文字，但判定含有文字（%s｜%s｜%.1fs）→ 照常翻譯",
+                         n, result.reason or "-", model, time.time() - t0)
+                return True
+            log.info("🖼 第 %d 頁判定為純插圖（%s｜%s｜%.1fs）→ 略過，不翻譯、不帶術語庫",
+                     n, result.reason or "-", model, time.time() - t0)
+            self._write_skipped(n, result.reason or "純插圖", "probe", model)
+            return False
+        except errors.ClientError as e:
+            if getattr(e, "code", None) == 429:
+                self.handle_rate_limit(e, model)
+            log.info("第 %d 頁的圖片判斷失敗（%s），照常翻譯", n, str(e)[:80])
+            return None
+        except Exception as e:
+            log.info("第 %d 頁的圖片判斷失敗（%s: %s），照常翻譯", n, type(e).__name__, str(e)[:80])
+            return None
+        finally:
+            for client, name in cleanup:
+                try:
+                    client.files.delete(name=name)
+                except Exception:
+                    pass
+
+    def _maybe_skip_textless(self, n: int) -> bool:
+        """抽不出文字的頁面：依「純圖片頁處理」設定決定是否略過。回傳 True = 已略過（不需翻譯）。"""
+        mode = self.cfg.image_page_mode
+        if mode == "translate" or len(self.page_text(n).strip()) >= 20:
+            return False
+        if mode == "skip":
+            log.info("🖼 第 %d 頁無可抽取文字 → 依設定略過（不呼叫 API）", n)
+            self._write_skipped(n, "設定：全部略過純圖片頁", "setting")
+            return True
+        if self.scanned_book:  # 掃描型 PDF：直接翻譯，由主請求的 translatable 欄位判斷（省一次請求）
+            return False
+        return self._probe_page(n) is False
+
     def _on_congestion(self, model: str) -> bool:
         """記一次伺服器端錯誤；若因此判定塞車且有其他模型可用，回傳 True（呼叫端應立刻換模型重試）。"""
         r = self.router
@@ -987,6 +1138,8 @@ class BookJob:
     def translate_page(self, n: int) -> str:
         """回傳 'ok' | 'failed' | 'stopped'"""
         cfg, km, r = self.cfg, self.km, self.router
+        if self._maybe_skip_textless(n):  # 純插圖：不翻譯、不帶術語庫
+            return "ok" if self.alive() else "stopped"
         fails = rate_hits = switches = 0
         last_err = ""
         forced: Optional[Tuple[str, str]] = None   # 被攔截後指定的（模型, 模式）
@@ -1081,6 +1234,14 @@ class BookJob:
                 if not self.alive():  # 強制停止後才回來的結果：直接丟棄
                     return "stopped"
                 r.record_ok(model)
+                if (cfg.image_page_mode == "auto" and not getattr(result, "translatable", True) and not result.translation.strip()
+                        and len(self.page_text(n).strip()) < 20):  # 沒有文字層、模型也說沒東西可翻 → 純插圖
+                    self.tokens_in += getattr(usage, "prompt_token_count", 0) or 0
+                    self.tokens_out += getattr(usage, "candidates_token_count", 0) or 0
+                    log.info("🖼 第 %d 頁判定為純插圖（%s）→ 略過（耗時 %.1fs，in=%s）", n, model,
+                             time.time() - t0, getattr(usage, "prompt_token_count", "?"))
+                    self._write_skipped(n, "模型判定沒有需要翻譯的文字", "main", model)
+                    return "ok"
                 self.commit_page(n, result, usage, model, mode)
                 log.info("✅ 第 %d 頁完成（%s%s｜總 %.1fs｜上傳 %.1fs｜生成 %.1fs｜in=%s out=%s think=%s）", n, model,
                          "｜純文字模式" if mode == "text" else "", time.time() - t0, self.last_upload_s, self.last_gen_s,
@@ -1123,6 +1284,10 @@ class BookJob:
             log.info("🔀 自動切換模型已啟用：%s", " → ".join(self.router.chain))
         _tpl, _src = load_prompt_template(cfg.prompt_file)
         log.info("📝 系統提示詞：%s（指紋 %s）", _src, hashlib.sha1(_tpl.encode("utf-8")).hexdigest()[:8])
+        if cfg.image_page_mode == "auto":
+            self._estimate_scanned()
+        elif cfg.image_page_mode == "skip":
+            log.info("🖼 純圖片頁處理：全部略過（抽不出文字的頁面不會呼叫 API）")
 
         consecutive = 0
         aborted = False
@@ -1149,6 +1314,9 @@ class BookJob:
             if self.alive():
                 count = self.merge()
                 log.info("📝 已合併 %d 頁 → %s", count, self.output_md)
+                if self.skipped:
+                    log.info("🖼 本輪判定為純插圖而略過 %d 頁：%s。若有誤判，把「純圖片頁處理」改成「全部翻譯」後對該頁強制重翻即可。",
+                             len(self.skipped), ", ".join(str(i) for i in sorted(self.skipped)))
 
         all_done = all(self.page_path(i).exists() for i in range(1, self.total + 1))
         if STOP.is_set() or not self.alive():
@@ -1233,6 +1401,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--write-default-prompt", action="store_true", help="把內建預設提示詞寫成檔案（已存在則不覆蓋）後離開")
     p.add_argument("--no-relax-safety", action="store_true", help="不放寬可調整的安全過濾")
     p.add_argument("--no-text-fallback", action="store_true", help="被安全機制攔截時，不改用純文字重試")
+    p.add_argument("--glossary-textless-cap", type=int, default=Config.glossary_textless_cap,
+                   help="純圖片頁（抽不出文字）最多帶入幾條術語；0 = 不帶（預設 %(default)s）")
+    p.add_argument("--image-pages", choices=["auto", "translate", "skip"], default=Config.image_page_mode,
+                   help="抽不出文字的頁面：auto = 自動判斷是否純插圖（預設）/ translate = 全部翻譯 / skip = 全部略過")
+    p.add_argument("--triage-model", default="", help="判斷是否純插圖用的模型（預設：備援清單中的 Flash-Lite，沒有就用主要模型）")
     p.add_argument("--max-fails", type=int, default=Config.max_fails)
     p.add_argument("--max-consecutive-fails", type=int, default=Config.max_consecutive_fails)
     p.add_argument("--with-prev-page", action="store_true", help="額外附上上一頁 PDF 當上下文（約 2 倍成本）")
@@ -1279,6 +1452,8 @@ def main(argv=None) -> int:
         auto_switch=args.auto_switch, congest_threshold=args.congest_threshold,
         recover_minutes=args.recover_minutes,
         prompt_file=args.prompt_file, relax_safety=not args.no_relax_safety,
+        glossary_textless_cap=args.glossary_textless_cap, image_page_mode=args.image_pages,
+        triage_model=args.triage_model,
         text_fallback=not args.no_text_fallback,
         fallback_models=[m.strip() for m in args.fallback_models.split(",") if m.strip()],
         page_markers=args.page_markers, join_pages=not args.no_join,

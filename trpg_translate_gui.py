@@ -89,6 +89,8 @@ except ImportError:
     pass
 STATUS_TEXT = {"complete": "完成", "partial": "部分完成", "stopped": "已停止", "error": "錯誤"}
 THINKING_CHOICES = ["none", "minimal", "low", "medium", "high"]
+# 抽不出文字的頁面怎麼處理（顯示文字, 引擎設定值）
+IMAGE_MODE_CHOICES = [("自動判斷", "auto"), ("全部翻譯", "translate"), ("全部略過", "skip")]
 # 現行 Gemini 3 系列中，可用於「讀 PDF 並輸出文字譯文」的型號（Live / TTS / 圖片 / 轉錄 / Omni 等型號不適用）
 MODEL_CHOICES = [
     "gemini-3.8-flash",
@@ -314,6 +316,8 @@ class App:
         self.interval_var = tk.StringVar(value=str(int(engine.Config.min_interval)))
         self.maxfails_var = tk.StringVar(value=str(engine.Config.max_fails))
         self.consec_var = tk.StringVar(value=str(engine.Config.max_consecutive_fails))
+        self.gcap_var = tk.StringVar(value=str(engine.Config.glossary_textless_cap))
+        self.imgmode_var = tk.StringVar(value=IMAGE_MODE_CHOICES[0][0])
         self.startkey_var = tk.StringVar(value="1")
         self.transport_var = tk.StringVar(value=engine.Config.transport)
         self.prev_var = tk.BooleanVar(value=False)
@@ -422,6 +426,11 @@ class App:
         add_row(1, 2, "請求間隔（秒）", ttk.Spinbox(sf, from_=0, to=120, increment=1, textvariable=self.interval_var, width=8))
         add_row(2, 0, "單頁重試上限", ttk.Spinbox(sf, from_=1, to=20, textvariable=self.maxfails_var, width=8))
         add_row(2, 2, "連續失敗中止", ttk.Spinbox(sf, from_=1, to=50, textvariable=self.consec_var, width=8))
+        self.gcap_spin = ttk.Spinbox(sf, from_=0, to=2000, increment=10, textvariable=self.gcap_var, width=8)
+        add_row(4, 0, "純圖片頁術語上限", self.gcap_spin)
+        self.imgmode_combo = ttk.Combobox(sf, textvariable=self.imgmode_var, width=10,
+                                          values=[label for label, _ in IMAGE_MODE_CHOICES], state="readonly")
+        add_row(4, 2, "純圖片頁處理", self.imgmode_combo)
         add_row(3, 0, "起始 Key 編號", ttk.Spinbox(sf, from_=1, to=99, textvariable=self.startkey_var, width=8))
         add_row(3, 2, "PDF 傳送方式", ttk.Combobox(sf, textvariable=self.transport_var, width=10,
                                                   values=["files", "inline"], state="readonly"))
@@ -608,6 +617,7 @@ class App:
         data = engine.load_json(SETTINGS_FILE, {})
         pairs = [("model", self.model_var), ("thinking", self.thinking_var), ("timeout", self.timeout_var),
                  ("interval", self.interval_var), ("max_fails", self.maxfails_var), ("consec", self.consec_var),
+                 ("gcap", self.gcap_var),
                  ("start_key", self.startkey_var), ("transport", self.transport_var), ("out", self.out_var),
                  ("sched_start_h", self.sched_start_h), ("sched_start_m", self.sched_start_m),
                  ("sched_end_h", self.sched_end_h), ("sched_end_m", self.sched_end_m),
@@ -626,6 +636,9 @@ class App:
                        ("relax", self.relax_var), ("textfb", self.textfb_var)):
             if k in data:
                 var.set(bool(data[k]))
+        mode_label = {code: label for label, code in IMAGE_MODE_CHOICES}.get(data.get("imgmode"))
+        if mode_label:
+            self.imgmode_var.set(mode_label)
         for p in data.get("pdfs", []):
             if Path(p).is_file():
                 self.add_pdf(Path(p), quiet=True)
@@ -635,6 +648,8 @@ class App:
             "model": self.model_var.get(), "thinking": self.thinking_var.get(),
             "timeout": self.timeout_var.get(), "interval": self.interval_var.get(),
             "max_fails": self.maxfails_var.get(), "consec": self.consec_var.get(),
+            "gcap": self.gcap_var.get(),
+            "imgmode": {label: code for label, code in IMAGE_MODE_CHOICES}.get(self.imgmode_var.get(), "auto"),
             "start_key": self.startkey_var.get(), "transport": self.transport_var.get(), "out": self.out_var.get(),
             "prev": self.prev_var.get(), "join": self.join_var.get(),
             "markers": self.markers_var.get(), "move": self.move_var.get(),
@@ -1106,6 +1121,13 @@ class App:
         tip(self.model_combo, "免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。\n"
                               "也可直接輸入其他型號名稱。")
         tip(self.auto_cb, "同一模型連續出現 503 / 504 / 逾時就判定塞車，改用備援模型；額度用完時也會切換。")
+        tip(self.imgmode_combo, "抽不出文字的頁面（純插圖或掃描頁）怎麼處理：\n"
+                                "• 自動判斷：先判斷是不是純插圖，純插圖整頁略過（不翻譯、不帶術語庫）；掃描的文字頁照常翻譯。\n"
+                                "　文字型 PDF 用備援清單中的 Flash-Lite 做小額探測；掃描型 PDF 由翻譯請求順便判斷，不多花請求。\n"
+                                "• 全部翻譯：不判斷，全部送去翻譯。\n• 全部略過：抽不出文字的頁面一律略過，不呼叫 API。\n"
+                                "略過的頁面會列在執行記錄中；誤判時改成「全部翻譯」後對該頁強制重翻即可。")
+        tip(self.gcap_spin, "有文字的頁面只會帶入「本頁出現的術語」。\n純圖片頁抽不出文字，無法這樣過濾，"
+                            "改為依鄰近頁原文與近期譯文挑選，並限制最多帶入這麼多條（0 = 不帶），避免白白浪費 token。")
         tip(self.relax_cb, "把 Google 官方「可調整」的安全類別（騷擾、仇恨、性內容、危險內容）設為不攔截，"
                            "適合成人向的虛構內容。\n注意：PROHIBITED_CONTENT 這類核心保護不受這個設定影響。")
         tip(self.textfb_cb, "整頁被攔截時，改成只送抽取出的文字（不附頁面圖片）再試一次。\n"
@@ -1139,6 +1161,8 @@ class App:
                 start_key=self._num(self.startkey_var, "起始 Key 編號", 1, 999),
                 max_fails=self._num(self.maxfails_var, "單頁重試上限", 1, 50),
                 max_consecutive_fails=self._num(self.consec_var, "連續失敗中止", 1, 500),
+                glossary_textless_cap=self._num(self.gcap_var, "純圖片頁術語上限", 0, 5000),
+                image_page_mode={label: code for label, code in IMAGE_MODE_CHOICES}.get(self.imgmode_var.get(), "auto"),
                 min_interval=self._num(self.interval_var, "請求間隔", 0, 600, float),
                 timeout=self._num(self.timeout_var, "單次逾時", 10, 3600),
                 transport=self.transport_var.get() or "files",
