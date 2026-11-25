@@ -25,7 +25,7 @@ TRPG 規則書 PDF 逐頁翻譯工具 v2
 """
 from __future__ import annotations
 
-__version__ = "2.9.0"
+__version__ = "2.12.0"
 
 import argparse
 import datetime
@@ -35,9 +35,11 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -146,6 +148,9 @@ class Config:
     page_markers: bool = False       # 合併檔每頁前加 <!-- p.N --> 註解
     join_pages: bool = True          # 合併時嘗試接回被分頁切斷的段落
     glossary_warn: int = 500
+    use_ocr: bool = True             # 抽不出文字的頁面，用本機 OCR 辨識圖中文字（需另裝 rapidocr；沒裝就自動略過這功能）
+    ocr_scale: float = 1.5           # OCR 渲染倍率（1.5 約 108 DPI；實測與 2.0 準確度相同但更快）
+    ocr_trust_empty: bool = True     # OCR 沒辨識到文字（或只有頁碼）→ 直接判定純插圖略過，不再問模型
     image_page_mode: str = "auto"    # 抽不出文字的頁面：auto = 自動判斷是否純插圖（純插圖略過）/ translate = 全部翻譯 / skip = 全部略過
     triage_model: str = ""           # 判斷「是否純插圖」用的模型；空 = 優先用備援清單中的 Flash-Lite，沒有就用主要模型
     glossary_textless_cap: int = 120  # 純圖片頁（抽不出文字、無法過濾術語庫）最多帶入幾條術語；0 = 不帶
@@ -532,6 +537,234 @@ def parse_response(resp, schema=None):
 
 
 # ============================================================
+# 本機 OCR（選用）：辨識圖片頁中的文字
+# ============================================================
+_OCR: Dict[str, object] = {"engine": None, "disabled": False, "backend": None, "ext": None}
+
+# 外部 OCR 子行程用的小程式（內嵌在這裡，執行時寫到暫存資料夾）。
+# 打包成 exe 後，exe 看不到電腦上 Python 裝的套件，所以改成「呼叫電腦上的 Python 來跑 OCR」：
+# 這個子行程常駐，模型只載入一次；溝通用單行 JSON（純 ASCII，避免編碼問題）。
+OCR_WORKER_SOURCE = r"""
+import sys, json
+def main():
+    proto = sys.stdout
+    sys.stdout = sys.stderr            # 套件偷偷印的東西不能混進通訊用的 stdout
+    def send(obj):
+        proto.write(json.dumps(obj) + "\n"); proto.flush()
+    try:
+        import numpy as np, pypdfium2 as pdfium, logging
+        from rapidocr import RapidOCR
+        eng = RapidOCR()
+        logging.getLogger("RapidOCR").setLevel(logging.WARNING)
+    except Exception as e:
+        send({"ready": False, "error": type(e).__name__ + ": " + str(e)}); return
+    send({"ready": True})
+    docs = {}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            cmd = req.get("cmd", "ocr")
+            if cmd == "quit":
+                break
+            if cmd == "close":
+                d = docs.pop(req["pdf"], None)
+                if d is not None:
+                    d.close()
+                send({"ok": True}); continue
+            path = req["pdf"]
+            if path not in docs:
+                docs[path] = pdfium.PdfDocument(path)
+            img = np.array(docs[path][req["page"] - 1].render(scale=req.get("scale", 1.5)).to_pil().convert("RGB"))
+            res = eng(img)
+            lines = [t.strip() for t, sc in zip(res.txts or [], res.scores or [])
+                     if t and t.strip() and (sc is None or float(sc) >= 0.5)]
+            send({"ok": True, "text": "\n".join(lines)})
+        except Exception as e:
+            send({"ok": False, "error": type(e).__name__ + ": " + str(e)})
+main()
+"""
+
+
+def _clean_env() -> Dict[str, str]:
+    """給子行程用的乾淨環境：拿掉 PyInstaller 打包後留下的變數，避免干擾電腦上的 Python。"""
+    env = dict(os.environ)
+    for k in list(env):
+        if k in ("PYTHONHOME", "PYTHONPATH") or k.startswith(("_PYI_", "_MEIPASS")):
+            env.pop(k, None)
+    for lib in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        if lib + "_ORIG" in env:
+            env[lib] = env.pop(lib + "_ORIG")
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+class ExternalOcr:
+    """透過「電腦上另外安裝的 Python」執行 OCR 的常駐子行程。"""
+
+    def __init__(self, cmd: List[str]):
+        self.cmd = cmd
+        self.proc: Optional["subprocess.Popen"] = None
+        self.q: "queue.Queue" = queue.Queue()
+        self._log = None
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def label(self) -> str:
+        return " ".join(self.cmd)
+
+    @staticmethod
+    def _reader(proc, q) -> None:
+        for raw in iter(proc.stdout.readline, b""):
+            q.put(raw.decode("utf-8", "replace"))
+        q.put(None)  # 行程結束
+
+    def _recv(self, timeout: float) -> dict:
+        try:
+            line = self.q.get(timeout=timeout)
+        except queue.Empty:
+            self.shutdown()
+            raise RuntimeError(f"OCR 子行程 {timeout:.0f} 秒沒有回應，已終止")
+        if line is None:
+            raise RuntimeError("OCR 子行程已結束（請確認那個 Python 已安裝 rapidocr、onnxruntime、pypdfium2）")
+        return json.loads(line)
+
+    def _send(self, obj: dict) -> None:
+        self.proc.stdin.write((json.dumps(obj) + "\n").encode("ascii"))
+        self.proc.stdin.flush()
+
+    def ensure(self, timeout: float = 240) -> None:
+        """啟動子行程並等它載入完模型。"""
+        if self.alive():
+            return
+        script = Path(tempfile.gettempdir()) / f"trpg_ocr_worker_{hashlib.sha1(OCR_WORKER_SOURCE.encode()).hexdigest()[:8]}.py"
+        if not script.exists():
+            script.write_text(OCR_WORKER_SOURCE, encoding="utf-8")
+        self._log = open(Path(tempfile.gettempdir()) / "trpg_ocr_worker.log", "wb")
+        kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}  # 不要跳出黑色視窗
+        self.q = queue.Queue()
+        self.proc = subprocess.Popen(self.cmd + ["-u", str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=self._log, env=_clean_env(), **kw)
+        threading.Thread(target=self._reader, args=(self.proc, self.q), daemon=True).start()
+        try:
+            msg = self._recv(timeout)
+        except Exception:
+            self.shutdown()
+            raise
+        if not msg.get("ready"):
+            self.shutdown()
+            raise RuntimeError(msg.get("error", "OCR 子行程啟動失敗"))
+
+    def ocr(self, pdf, page: int, scale: float, timeout: float = 180) -> str:
+        self.ensure()
+        self._send({"pdf": str(pdf), "page": int(page), "scale": float(scale)})
+        resp = self._recv(timeout)
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error", "OCR 失敗"))
+        return resp.get("text", "")
+
+    def close_pdf(self, pdf) -> None:
+        """請子行程放開這個 PDF（Windows 上不放開的話，之後搬移檔案會被鎖住）。"""
+        if self.alive():
+            try:
+                self._send({"cmd": "close", "pdf": str(pdf)})
+                self._recv(10)
+            except Exception:
+                pass
+
+    def shutdown(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                proc.stdin.write(b'{"cmd": "quit"}\n')
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self._log is not None:
+            try:
+                self._log.close()
+            except Exception:
+                pass
+            self._log = None
+
+
+def _inproc_ok() -> bool:
+    """本程式自己的 Python 環境裡，是否裝好 OCR 套件。"""
+    import importlib.util as iu
+    return all(iu.find_spec(m) is not None for m in ("rapidocr", "pypdfium2", "onnxruntime", "numpy"))
+
+
+def _ocr_python_candidates() -> List[List[str]]:
+    """電腦上可能裝了 OCR 套件的 Python（依序嘗試）。"""
+    cands: List[List[str]] = []
+    env = os.environ.get("TRPG_OCR_PYTHON")
+    if env:
+        cands.append([env])
+    venv = Path.home() / "Library" / "Application Support" / "TRPG_Translator" / "venv" / "bin" / "python"
+    if venv.exists():  # macOS：啟動工具用的專用環境
+        cands.append([str(venv)])
+    names = [["py", "-3"], ["python"], ["python3"]] if sys.platform == "win32" else [["python3"], ["python"]]
+    for c in names:
+        if shutil.which(c[0]):
+            cands.append(c)
+    return cands
+
+
+def ocr_status(verify: bool = False) -> Tuple[bool, str]:
+    """檢查本機 OCR 能不能用。回傳 (可用, 說明)。
+    verify=False：只做便宜的檢查（不啟動任何行程）；verify=True：實際啟動並確認外部 Python 的 OCR 能載入。"""
+    if _inproc_ok():
+        _OCR["backend"] = "inproc"
+        return True, "RapidOCR"
+    ext = _OCR.get("ext")
+    if ext is not None and ext.alive():
+        _OCR["backend"] = "external"
+        return True, f"RapidOCR（透過電腦上的 Python：{ext.label()}）"
+    cands = _ocr_python_candidates()
+    hint = "（pip install rapidocr onnxruntime pypdfium2）"
+    if not cands:
+        return False, "缺少套件：rapidocr, pypdfium2, onnxruntime, numpy" + hint
+    if not verify:
+        return True, f"找到電腦上的 Python（{' '.join(cands[0])}），開始翻譯時會確認它是否已安裝 OCR 套件"
+    last = ""
+    for cmd in cands:
+        cand = ExternalOcr(cmd)
+        try:
+            cand.ensure()
+        except Exception as e:
+            last = f"{' '.join(cmd)}：{str(e)[:120]}"
+            continue
+        _OCR["ext"], _OCR["backend"] = cand, "external"
+        return True, f"RapidOCR（透過電腦上的 Python：{cand.label()}）"
+    return False, f"電腦上的 Python 沒有可用的 OCR 套件（{last}）" + hint
+
+
+def shutdown_ocr() -> None:
+    """結束外部 OCR 子行程（翻譯全部結束、關閉程式時呼叫）。"""
+    ext = _OCR.get("ext")
+    if ext is not None:
+        ext.shutdown()
+    _OCR["ext"] = None
+    _OCR["backend"] = None
+
+
+def _get_ocr_engine():
+    if _OCR["engine"] is None:
+        # 用 importlib 動態載入：PyInstaller 的靜態分析看不到，打包 exe 時不會把 OCR 套件整串拖進去
+        import importlib
+        _OCR["engine"] = importlib.import_module("rapidocr").RapidOCR()
+    logging.getLogger("RapidOCR").setLevel(logging.WARNING)  # 預設每次都印好幾行 INFO，太吵
+    return _OCR["engine"]
+
+
+# ============================================================
 # 系統提示詞（存放在獨立檔案，可由使用者修改）
 # ============================================================
 TRIAGE_PROMPT = """請判斷這一頁是否含有「需要翻譯的文字」。
@@ -728,6 +961,11 @@ class BookJob:
         self.glossary: Dict[str, str] = {}
         self._glossary_lower: Set[str] = set()
         self._text_cache: Dict[int, str] = {}
+        self._ocr_cache: Dict[int, str] = {}
+        self._ocr_ok: Optional[bool] = None   # None = 尚未檢查
+        self._ocr_why = ""
+        self._ocr_fail = 0
+        self._pdfium = None
         self._warned_full_glossary = False
         self.tokens_in = 0
         self.tokens_out = 0
@@ -768,7 +1006,8 @@ class BookJob:
         save_json(self.failed_path, data)
 
     # ---------- PDF 內容 ----------
-    def page_text(self, n: int) -> str:
+    def native_text(self, n: int) -> str:
+        """PDF 本身的文字層（不含 OCR）。"""
         if not 1 <= n <= self.total:
             return ""
         if n not in self._text_cache:
@@ -780,6 +1019,82 @@ class BookJob:
             while len(self._text_cache) > 6:
                 self._text_cache.pop(next(iter(self._text_cache)))
         return self._text_cache[n]
+
+    def page_text(self, n: int) -> str:
+        """本頁文字：優先用 PDF 文字層；抽不出來時，用本機 OCR 辨識圖中文字（若有啟用且可用）。"""
+        t = self.native_text(n)
+        if len(t.strip()) >= 20 or not self._ocr_enabled():
+            return t
+        return self._ocr_text(n) or t
+
+    # ---------- 本機 OCR ----------
+    def _ocr_enabled(self) -> bool:
+        if not self.cfg.use_ocr or _OCR["disabled"]:
+            return False
+        if self._ocr_ok is None:
+            self._ocr_ok, self._ocr_why = ocr_status(verify=True)  # 外部 Python 要實際啟動一次來確認
+            if not self._ocr_ok:
+                log.info("🔎 本機 OCR 未啟用：%s（沿用原本的判斷流程）", self._ocr_why)
+        return bool(self._ocr_ok)
+
+    def _render_path(self) -> Path:
+        unlocked = self.folder / "_unlocked.pdf"
+        return unlocked if unlocked.exists() else self.pdf_path
+
+    def _run_ocr(self, n: int) -> str:
+        if _OCR.get("backend") == "external":  # 打包版：交給電腦上的 Python 子行程辨識
+            return _OCR["ext"].ocr(self._render_path(), n, self.cfg.ocr_scale)
+        import importlib  # 動態載入，避免打包 exe 時被靜態分析拖進 numpy / pypdfium2
+        np = importlib.import_module("numpy")
+        pdfium = importlib.import_module("pypdfium2")
+        if self._pdfium is None:
+            self._pdfium = pdfium.PdfDocument(str(self._render_path()))
+        img = np.array(self._pdfium[n - 1].render(scale=self.cfg.ocr_scale).to_pil().convert("RGB"))
+        res = _get_ocr_engine()(img)
+        lines = []
+        for t, sc in zip(res.txts or [], res.scores or []):
+            if t and t.strip() and (sc is None or float(sc) >= 0.5):  # 丟掉信心太低的雜訊
+                lines.append(t.strip())
+        return "\n".join(lines)
+
+    def _ocr_text(self, n: int) -> str:
+        if n in self._ocr_cache:
+            return self._ocr_cache[n]
+        f = self.folder / "ocr" / f"{n:04d}.txt"
+        try:
+            if f.exists():
+                text = f.read_text(encoding="utf-8")
+            else:
+                t0 = time.time()
+                text = self._run_ocr(n)
+                f.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(f, text)
+                log.info("🔎 第 %d 頁無文字層，OCR 辨識出 %d 字元（%.1fs）", n, len(text), time.time() - t0)
+            self._ocr_fail = 0
+        except Exception as e:
+            self._ocr_fail += 1
+            log.warning("⚠️ 第 %d 頁 OCR 失敗（%s: %s）", n, type(e).__name__, str(e)[:100])
+            if self._ocr_fail >= 3:
+                _OCR["disabled"] = True
+                log.warning("⚠️ OCR 連續失敗 3 次，本次執行改為停用 OCR，沿用原本的流程")
+            text = ""
+        self._ocr_cache[n] = text
+        return text
+
+    def _ocr_conclusive_empty(self, n: int) -> bool:
+        """OCR 沒辨識到任何文字，或只有頁碼 / 符號（沒有任何字母或文字）。"""
+        return len(re.sub(r"[\W\d_]+", "", self._ocr_text(n))) == 0
+
+    def _close_ocr(self) -> None:
+        ext = _OCR.get("ext")
+        if ext is not None and _OCR.get("backend") == "external":
+            ext.close_pdf(self._render_path())
+        if self._pdfium is not None:
+            try:
+                self._pdfium.close()  # Windows 上不關閉的話，之後搬移 PDF 會被檔案鎖住
+            except Exception:
+                pass
+            self._pdfium = None
 
     def page_bytes(self, n: int) -> bytes:
         writer = PdfWriter()
@@ -975,6 +1290,7 @@ class BookJob:
             "new_terms": [t.model_dump() for t in result.new_terms],
             "model": model,
             "source": mode,
+            "text_source": "ocr" if (len(self.native_text(n).strip()) < 20 and len(self._ocr_cache.get(n, "").strip()) >= 20) else "native",
             "prompt": self.prompt_sig,
             "key_id": self.km.ids[self.km.index],
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1036,7 +1352,7 @@ class BookJob:
         """抽樣最多 20 頁看有多少頁抽得出文字：多數抽不出來 = 掃描型 PDF。"""
         k = min(20, self.total)
         idxs = sorted({1 + int(i * (self.total - 1) / max(k - 1, 1)) for i in range(k)})
-        texty = sum(1 for n in idxs if len(self.page_text(n).strip()) >= 20)
+        texty = sum(1 for n in idxs if len(self.native_text(n).strip()) >= 20)
         ratio = texty / len(idxs)
         self.scanned_book = ratio < 0.5
         log.info("🧾 抽樣 %d 頁：%d 頁抽得出文字 → 判定為「%s」", len(idxs), texty,
@@ -1117,6 +1433,12 @@ class BookJob:
         if mode == "skip":
             log.info("🖼 第 %d 頁無可抽取文字 → 依設定略過（不呼叫 API）", n)
             self._write_skipped(n, "設定：全部略過純圖片頁", "setting")
+            return True
+        if self._ocr_enabled() and self.cfg.ocr_trust_empty and self._ocr_conclusive_empty(n):
+            seen = self._ocr_text(n).strip()
+            log.info("🖼 第 %d 頁 OCR %s → 判定為純插圖，略過（不呼叫 API、不帶術語庫）", n,
+                     f"只辨識到「{seen}」（頁碼或符號）" if seen else "沒有辨識到任何文字")
+            self._write_skipped(n, "OCR 沒有辨識到文字" + (f"（只有「{seen}」）" if seen else ""), "ocr")
             return True
         if self.scanned_book:  # 掃描型 PDF：直接翻譯，由主請求的 translatable 欄位判斷（省一次請求）
             return False
@@ -1284,6 +1606,9 @@ class BookJob:
             log.info("🔀 自動切換模型已啟用：%s", " → ".join(self.router.chain))
         _tpl, _src = load_prompt_template(cfg.prompt_file)
         log.info("📝 系統提示詞：%s（指紋 %s）", _src, hashlib.sha1(_tpl.encode("utf-8")).hexdigest()[:8])
+        if cfg.use_ocr:
+            if self._ocr_enabled():
+                log.info("🔎 本機 OCR：可用（%s）", self._ocr_why)
         if cfg.image_page_mode == "auto":
             self._estimate_scanned()
         elif cfg.image_page_mode == "skip":
@@ -1311,6 +1636,7 @@ class BookJob:
                 else:
                     break
         finally:
+            self._close_ocr()
             if self.alive():
                 count = self.merge()
                 log.info("📝 已合併 %d 頁 → %s", count, self.output_md)
@@ -1406,6 +1732,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--image-pages", choices=["auto", "translate", "skip"], default=Config.image_page_mode,
                    help="抽不出文字的頁面：auto = 自動判斷是否純插圖（預設）/ translate = 全部翻譯 / skip = 全部略過")
     p.add_argument("--triage-model", default="", help="判斷是否純插圖用的模型（預設：備援清單中的 Flash-Lite，沒有就用主要模型）")
+    p.add_argument("--no-ocr", action="store_true", help="不使用本機 OCR（抽不出文字的頁面不辨識圖中文字）")
+    p.add_argument("--ocr-scale", type=float, default=Config.ocr_scale, help="OCR 渲染倍率（預設 %(default)s）")
+    p.add_argument("--ocr-always-probe", action="store_true", help="OCR 沒辨識到文字時，仍交給模型確認（預設直接略過）")
     p.add_argument("--max-fails", type=int, default=Config.max_fails)
     p.add_argument("--max-consecutive-fails", type=int, default=Config.max_consecutive_fails)
     p.add_argument("--with-prev-page", action="store_true", help="額外附上上一頁 PDF 當上下文（約 2 倍成本）")
@@ -1453,7 +1782,8 @@ def main(argv=None) -> int:
         recover_minutes=args.recover_minutes,
         prompt_file=args.prompt_file, relax_safety=not args.no_relax_safety,
         glossary_textless_cap=args.glossary_textless_cap, image_page_mode=args.image_pages,
-        triage_model=args.triage_model,
+        triage_model=args.triage_model, use_ocr=not args.no_ocr, ocr_scale=args.ocr_scale,
+        ocr_trust_empty=not args.ocr_always_probe,
         text_fallback=not args.no_text_fallback,
         fallback_models=[m.strip() for m in args.fallback_models.split(",") if m.strip()],
         page_markers=args.page_markers, join_pages=not args.no_join,
@@ -1500,6 +1830,7 @@ def main(argv=None) -> int:
         if failed:
             log.warning("⚠️ [%s] 失敗頁：%s（重新執行即會自動重試）", job.name, ", ".join(sorted(failed, key=int)))
 
+    shutdown_ocr()
     log.info("🏁 結束。結果：%s", "；".join(f"{n}={s}" for n, s in summary) or "（無）")
     return exit_code
 

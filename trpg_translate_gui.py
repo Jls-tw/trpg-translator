@@ -29,7 +29,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # 打包成 exe 後，設定檔與 .env 放在 exe 旁邊（而不是暫存解壓目錄）
 if getattr(sys, "frozen", False):
@@ -271,6 +271,11 @@ class App:
         self.grips: List[tk.Widget] = []
         self.list_min = LIST_MIN      # PDF 清單的最小高度（版面建好後依右側按鈕高度重算）
         self._prompt_win = None
+        self._rb = None               # 清單框選狀態
+        self._rb_frames: List[tk.Widget] = []
+        self.log_buffer: List[Tuple[int, str]] = []   # 執行記錄的歷史（彈出視窗開啟時回放）
+        self._log_win = None
+        self._log_win_text = None
         self._idle_windows = 0       # 連續幾個排程時段沒有任何進展
         self._window_done0 = 0       # 本時段開始時的已完成頁數
         self._had_fatal = False
@@ -351,6 +356,7 @@ class App:
         # 內容攔截
         self.relax_var = tk.BooleanVar(value=True)
         self.textfb_var = tk.BooleanVar(value=True)
+        self.ocr_var = tk.BooleanVar(value=True)
 
     # ---------- 介面 ----------
     def _build_ui(self) -> None:
@@ -385,8 +391,14 @@ class App:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
-        self.tree.bind("<Double-1>", lambda e: self.on_open_result())
+        self.tree.bind("<Double-1>", self._on_tree_double)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_progress())
+        self.tree.bind("<ButtonPress-1>", self._tree_press, add="+")      # 點空白處取消選取 / 框選起點
+        self.tree.bind("<B1-Motion>", self._tree_drag, add="+")           # 拖曳框選
+        self.tree.bind("<ButtonRelease-1>", self._tree_release, add="+")
+        for seq in (("<Button-2>", "<Button-3>", "<Control-Button-1>") if sys.platform == "darwin" else ("<Button-3>",)):
+            self.tree.bind(seq, self._tree_context)                       # 右鍵選單
+        box.bind("<Button-1>", self._box_click)                            # 點清單框的空白邊緣也取消選取
 
         btns = ttk.Frame(box)
         btns.grid(row=0, column=2, sticky="ns", padx=(10, 0))
@@ -398,7 +410,6 @@ class App:
         ]
         for b in self.list_buttons:
             b.pack(fill="x", pady=2)
-        ttk.Button(btns, text="開啟譯文 / 資料夾", command=self.on_open_result).pack(fill="x", pady=(14, 2))
 
         # --- ②③④⑤ 設定 ---
         mid = ttk.Frame(root)
@@ -458,8 +469,11 @@ class App:
         self.textfb_cb = ttk.Checkbutton(sf, text="被安全機制攔截時，改用純文字重試", variable=self.textfb_var)
         self.textfb_cb.grid(row=13, column=0, columnspan=4, sticky="w", pady=1)
         self.settings_widgets += [self.relax_cb, self.textfb_cb]
+        self.ocr_cb = ttk.Checkbutton(sf, text="用本機 OCR 辨識圖片頁中的文字（需另裝 rapidocr）", variable=self.ocr_var)
+        self.ocr_cb.grid(row=14, column=0, columnspan=4, sticky="w", pady=1)
+        self.settings_widgets.append(self.ocr_cb)
         self.prompt_btn = ttk.Button(sf, text="檢視 / 編輯系統提示詞…", command=self.on_edit_prompt)
-        self.prompt_btn.grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.prompt_btn.grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right = ttk.Frame(mid)
         right.grid(row=0, column=1, sticky="nsew")
@@ -526,8 +540,22 @@ class App:
         ttk.Label(pf, textvariable=self.progress_text).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         # --- 記錄（下半部）---
-        lf = ttk.LabelFrame(root, text=" 執行記錄 ", padding=4)
+        hdr = ttk.Frame(root)
+        ttk.Label(hdr, text="執行記錄").pack(side="left", padx=(2, 8))
+        self.log_popout_btn = ttk.Button(hdr, text="彈出視窗", width=9, command=self.on_popout_log)
+        self.log_popout_btn.pack(side="left")
+        try:  # 用標題列元件放按鈕：不佔用記錄區的版面
+            lf = ttk.LabelFrame(root, labelwidget=hdr, padding=4)
+        except tk.TclError:
+            hdr.destroy()
+            lf = ttk.LabelFrame(root, text=" 執行記錄 ", padding=4)
+            self.log_popout_btn = ttk.Button(lf, text="彈出視窗", width=9, command=self.on_popout_log)
+            self.log_popout_btn.place(relx=1.0, x=-4, y=2, anchor="ne")
         lf.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 0))
+        try:
+            hdr.lift()
+        except tk.TclError:
+            pass
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
         lf.grid_propagate(False)
@@ -633,7 +661,7 @@ class App:
                        ("sched_start_on", self.sched_start_on), ("sched_end_on", self.sched_end_on),
                        ("auto", self.auto_var),
                        ("dark", self.dark_var), ("tray", self.tray_var),
-                       ("relax", self.relax_var), ("textfb", self.textfb_var)):
+                       ("relax", self.relax_var), ("textfb", self.textfb_var), ("ocr", self.ocr_var)):
             if k in data:
                 var.set(bool(data[k]))
         mode_label = {code: label for label, code in IMAGE_MODE_CHOICES}.get(data.get("imgmode"))
@@ -659,7 +687,7 @@ class App:
             "auto": self.auto_var.get(), "fallback": self.fallback_var.get(),
             "congest": self.congest_var.get(), "recover": self.recover_var.get(),
             "dark": self.dark_var.get(), "tray": self.tray_var.get(),
-            "relax": self.relax_var.get(), "textfb": self.textfb_var.get(),
+            "relax": self.relax_var.get(), "textfb": self.textfb_var.get(), "ocr": self.ocr_var.get(),
             "pdfs": [str(b["path"]) for b in self.books.values()],
         }
         try:
@@ -703,6 +731,9 @@ class App:
         self.refresh_stats(once=True)
 
     def on_remove(self) -> None:
+        if self.running or self.waiting:
+            messagebox.showinfo("進行中", "翻譯進行中（或排程等待中），請先停止再移除。")
+            return
         for iid in self.tree.selection():
             self.tree.delete(iid)
             self.books.pop(iid, None)
@@ -716,16 +747,173 @@ class App:
         sel = [i for i in self.tree.selection() if i in self.books]
         return sel or list(self.books.keys())
 
+    def _on_tree_double(self, event) -> None:
+        """雙擊某一列 → 開啟譯文（沒有譯文就開啟資料夾）；雙擊空白處不做事。"""
+        if self.tree.identify_row(event.y):
+            self.on_open_result()
+
     def on_open_result(self) -> None:
-        sel = [i for i in self.tree.selection() if i in self.books]
+        sel = self._selected_ids()
         if not sel:
-            if self.out_var.get().strip() and Path(self.out_var.get()).is_dir():
-                open_path(Path(self.out_var.get()))
             return
         b = self.books[sel[0]]
-        folder = self.out_root(b["path"]) / b["name"]
-        md = folder / f"{b['name']}_翻譯.md"
+        md = self._translation_path(b)
+        folder = self._book_folder(b)
         open_path(md if md.exists() else folder if folder.exists() else folder.parent)
+
+    # ---------- PDF 清單：取消選取、框選、右鍵選單 ----------
+    RB_THRESHOLD = 4  # 滑鼠移動超過幾像素才算開始框選
+
+    def _selected_ids(self) -> List[str]:
+        return [i for i in self.tree.selection() if i in self.books]
+
+    def _book_folder(self, b: dict) -> Path:
+        return self.out_root(b["path"]) / b["name"]
+
+    def _translation_path(self, b: dict) -> Path:
+        return self._book_folder(b) / f"{b['name']}_翻譯.md"
+
+    def _original_path(self, b: dict) -> Optional[Path]:
+        """原始 PDF：優先用清單中的路徑；若已被搬進輸出資料夾，就找搬過去的那份。"""
+        if b["path"].exists():
+            return b["path"]
+        moved = self._book_folder(b) / b["path"].name
+        return moved if moved.exists() else None
+
+    def _tree_press(self, event) -> None:
+        tree = self.tree
+        region = tree.identify_region(event.x, event.y)
+        if region in ("heading", "separator"):
+            self._rb = None
+            return
+        row = tree.identify_row(event.y)
+        additive = bool(event.state & 0x5)  # Shift 或 Control
+        self._rb = {"x0": event.x, "y0": event.y, "active": False,
+                    "additive": additive, "base": set(tree.selection()) if additive else set()}
+        if not row and not additive:  # 點在空白處 → 取消選取（之後按「開始翻譯」會處理清單內全部 PDF）
+            tree.selection_set(())
+
+    def _tree_drag(self, event):
+        rb = self._rb
+        if not rb:
+            return None
+        if not rb["active"]:
+            if abs(event.x - rb["x0"]) < self.RB_THRESHOLD and abs(event.y - rb["y0"]) < self.RB_THRESHOLD:
+                return None
+            rb["active"] = True
+        tree = self.tree
+        w, h = int(tree.winfo_width()), int(tree.winfo_height())
+        x1, y1 = min(max(event.x, 0), w), min(max(event.y, 0), h)
+        left, right = sorted((rb["x0"], x1))
+        top, bottom = sorted((rb["y0"], y1))
+        hit = set()
+        for iid in tree.get_children(""):
+            bb = tree.bbox(iid)
+            if not bb:
+                continue
+            bx, by, bw, bh = bb
+            if by < bottom and by + bh > top and bx < right and bx + bw > left:
+                hit.add(iid)
+        chosen = (hit | rb["base"]) if rb["additive"] else hit
+        tree.selection_set(tuple(i for i in tree.get_children("") if i in chosen))
+        self._rb_draw(left, top, right, bottom)
+        return "break"  # 擋掉預設的拖曳行為
+
+    def _rb_draw(self, left: int, top: int, right: int, bottom: int) -> None:
+        """用四條細線畫出框選的矩形（Treeview 本身不支援畫框）。"""
+        if not self._rb_frames:
+            color = (DARK if self.dark_var.get() else LIGHT)["accent"]
+            self._rb_frames = [tk.Frame(self.tree, bg=color) for _ in range(4)]
+        w, h = max(right - left, 1), max(bottom - top, 1)
+        geo = [(left, top, w, 1), (left, max(bottom - 1, top), w, 1),
+               (left, top, 1, h), (max(right - 1, left), top, 1, h)]
+        for fr, (x, y, ww, hh) in zip(self._rb_frames, geo):
+            fr.place(x=x, y=y, width=ww, height=hh)
+            fr.lift()
+
+    def _tree_release(self, event) -> None:
+        for fr in self._rb_frames:
+            fr.place_forget()
+        self._rb = None
+
+    def _box_click(self, event) -> None:
+        if event.widget is self.list_frame:  # 點到清單外框的空白邊緣
+            self.tree.selection_set(())
+
+    def _tree_context(self, event) -> None:
+        tree = self.tree
+        row = tree.identify_row(event.y)
+        if not row or row not in self.books:
+            return
+        if row not in tree.selection():
+            tree.selection_set((row,))
+        menu = self._build_context_menu()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_context_menu(self):
+        sel = self._selected_ids()
+        n = len(sel)
+        suffix = f"（{n} 個）" if n > 1 else ""
+        busy = self.running or self.waiting
+        has_md = any(self._translation_path(self.books[i]).exists() for i in sel)
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="開啟原文" + suffix, command=self.open_selected_original)
+        m.add_command(label="開啟譯文" + suffix, command=self.open_selected_translation,
+                      state="normal" if has_md else "disabled")
+        m.add_command(label="開啟資料夾" + suffix, command=self.open_selected_folder)
+        m.add_separator()
+        m.add_command(label="從列表移除" + suffix, command=self.on_remove, state="disabled" if busy else "normal")
+        c = DARK if self.dark_var.get() else None
+        if c:
+            try:
+                m.configure(bg=c["field"], fg=c["fg"], activebackground=c["sel"], activeforeground="#ffffff")
+            except tk.TclError:
+                pass
+        return m
+
+    def _confirm_many(self, n: int, what: str) -> bool:
+        return n <= 5 or messagebox.askyesno("一次開啟多個", f"要同時開啟 {n} 個{what}嗎？")
+
+    def open_selected_original(self) -> None:
+        sel = self._selected_ids()
+        paths, missing = [], []
+        for i in sel:
+            b = self.books[i]
+            pth = self._original_path(b)
+            (paths if pth else missing).append(pth or b["path"])
+        if missing:
+            messagebox.showinfo("找不到原文", "找不到下列 PDF（可能已被移動或刪除）：\n" + "\n".join(str(m) for m in missing))
+        if paths and self._confirm_many(len(paths), "原文 PDF"):
+            for pth in paths:
+                open_path(pth)
+
+    def open_selected_translation(self) -> None:
+        sel = self._selected_ids()
+        found, missing = [], []
+        for i in sel:
+            b = self.books[i]
+            md = self._translation_path(b)
+            (found if md.exists() else missing).append(md if md.exists() else b["name"])
+        if missing:
+            messagebox.showinfo("尚未產生譯文", "下列項目還沒有譯文（翻譯後才會產生）：\n" + "\n".join(str(m) for m in missing))
+        if found and self._confirm_many(len(found), "譯文"):
+            for md in found:
+                open_path(md)
+
+    def open_selected_folder(self) -> None:
+        folders: List[Path] = []
+        for i in self._selected_ids():
+            b = self.books[i]
+            f = self._book_folder(b)
+            target = f if f.exists() else f.parent if f.parent.exists() else b["path"].parent
+            if target not in folders:
+                folders.append(target)
+        if folders and self._confirm_many(len(folders), "資料夾"):
+            for f in folders:
+                open_path(f)
 
     # ---------- Key 管理 ----------
     def on_manage_keys(self) -> None:
@@ -854,6 +1042,12 @@ class App:
         self.log_text.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
         self.log_text.tag_configure("warn", foreground=c["warn"])
         self.log_text.tag_configure("error", foreground=c["err"])
+        if self._log_win_text is not None:  # 彈出的記錄視窗也跟著換色
+            try:
+                self._log_win.configure(bg=c["bg"])
+                self._style_log_widget(self._log_win_text)
+            except tk.TclError:
+                self._log_win = self._log_win_text = None
         for gw in self.grips:
             gw.configure(bg=c["bg"])
         self.theme_btn.configure(text="☀" if dark else "☾")  # 深色模式顯示太陽（點了切回淺色），淺色顯示月亮
@@ -882,7 +1076,8 @@ class App:
     def _style_dialog(self, win, txt) -> None:
         c = DARK if self.dark_var.get() else LIGHT
         win.configure(bg=c["bg"])
-        txt.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
+        if txt is not None:
+            txt.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
 
     # ---------- 縮到系統匣 ----------
     def _on_tray_toggle(self) -> None:
@@ -1116,8 +1311,11 @@ class App:
 
     def _add_tooltips(self) -> None:
         tip = lambda w, text: Tooltip(w, text, self._tip_colors)
-        tip(self.tree, "未選取任何項目時，會處理清單中的全部 PDF；雙擊可開啟譯文。\n"
-                       "拖曳各框下方的橫條，可分別調整清單與執行記錄的高度。")
+        tip(self.tree, "• 未選取任何項目時，會處理清單中的全部 PDF；點空白處可取消選取。\n"
+                       "• 可拖曳滑鼠框選多個 PDF（按住 Ctrl 可追加選取）。\n"
+                       "• 雙擊開啟譯文；按右鍵有「開啟原文 / 譯文 / 資料夾、從列表移除」。\n"
+                       "• 拖曳各框下方的橫條，可分別調整清單與執行記錄的高度。")
+        tip(self.log_popout_btn, "把執行記錄放到獨立視窗檢視，可自由調整大小、移到其他螢幕。")
         tip(self.model_combo, "免費層可用：3.8 / 3.6 Flash、3.5 / 3.1 Flash-Lite；3.1 Pro 需付費。\n"
                               "也可直接輸入其他型號名稱。")
         tip(self.auto_cb, "同一模型連續出現 503 / 504 / 逾時就判定塞車，改用備援模型；額度用完時也會切換。")
@@ -1132,6 +1330,12 @@ class App:
                            "適合成人向的虛構內容。\n注意：PROHIBITED_CONTENT 這類核心保護不受這個設定影響。")
         tip(self.textfb_cb, "整頁被攔截時，改成只送抽取出的文字（不附頁面圖片）再試一次。\n"
                             "插圖被誤判時特別有用；若原文文字本身被攔截則無效。")
+        tip(self.ocr_cb, lambda: "沒有文字層的頁面（掃描頁、圖片文字），改用你電腦上的 OCR 辨識圖中文字：\n"
+                              "• 辨識出的文字用來精準挑選本頁用得到的術語（不用整份帶入），也用於跨頁銜接與被攔截時的純文字重試。\n"
+                              "• 辨識不到文字或只有頁碼 → 判定為純插圖，直接略過，不呼叫 API。\n"
+                              "• 完全在本機執行，不花 API 額度；辨識結果存在書的資料夾 ocr/，續傳不用重辨識。\n"
+                              "• 打包成 exe 的版本會自動呼叫「這台電腦上的 Python」來跑 OCR（該 Python 需已安裝 rapidocr）。\n\n"
+                              "目前狀態：" + ("可用（" + engine.ocr_status()[1] + "）" if engine.ocr_status()[0] else "未安裝 — " + engine.ocr_status()[1]))
         tip(self.prompt_btn, "系統提示詞存放在獨立檔案，可在這裡檢視與修改；儲存後下一頁翻譯就會套用。")
         tip(self.out_entry, "譯文與進度會存在此資料夾下的「書名」子資料夾。")
         for w in self.sched_widgets:
@@ -1172,6 +1376,7 @@ class App:
                 move_pdf=self.move_var.get(),
                 relax_safety=self.relax_var.get(),
                 text_fallback=self.textfb_var.get(),
+                use_ocr=self.ocr_var.get(),
                 prompt_file=str(PROMPT_FILE),
                 auto_switch=self.auto_var.get(),
                 fallback_models=[m for m in re.split(r"[,;\s]+", self.fallback_var.get()) if m],
@@ -1309,6 +1514,7 @@ class App:
                 "已完成的頁面都已存檔，不受影響，下次可續傳。\n\n確定要強制停止嗎？"):
             return
         engine.abort_all()
+        engine.shutdown_ocr()
         targets = list(self.pending["targets"]) if self.pending else []
         self.run_token = None
         self.running = False
@@ -1525,6 +1731,7 @@ class App:
         self.refresh_stats(once=True)
 
     def _on_finished(self) -> None:
+        engine.shutdown_ocr()  # 結束外部 OCR 子行程（下次開始時會自動重啟）
         stopped = engine.STOP.is_set()
         by_schedule = self._end_signaled
         sched = self.sched
@@ -1581,19 +1788,74 @@ class App:
             messagebox.showinfo("翻譯結束", "\n".join(lines) +
                                 "\n\n有失敗頁時，再按一次「開始翻譯」即會自動重試。")
 
+    def _tag_for(self, level: int) -> str:
+        return "error" if level >= logging.ERROR else "warn" if level >= logging.WARNING else ""
+
+    def _write_log(self, widget, msg: str, tag: str) -> None:
+        at_bottom = widget.yview()[1] >= 0.999
+        widget.configure(state="normal")
+        widget.insert("end", msg + "\n", tag)
+        total = int(widget.index("end-1c").split(".")[0])
+        if total > 3000:
+            widget.delete("1.0", f"{total - 3000}.0")
+        if at_bottom:
+            widget.see("end")
+        widget.configure(state="disabled")
+
     def append_log(self, level: int, msg: str) -> None:
         msg = "".join(c for c in msg if ord(c) <= 0xFFFF)  # Tk 在部分系統無法顯示 emoji 等字元
-        tag = "error" if level >= logging.ERROR else "warn" if level >= logging.WARNING else ""
-        at_bottom = self.log_text.yview()[1] >= 0.999
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n", tag)
-        total = int(self.log_text.index("end-1c").split(".")[0])
-        if total > 3000:
-            self.log_text.delete("1.0", f"{total - 3000}.0")
-        if at_bottom:
-            self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        tag = self._tag_for(level)
+        self.log_buffer.append((level, msg))
+        if len(self.log_buffer) > 5000:
+            del self.log_buffer[:len(self.log_buffer) - 5000]
+        self._write_log(self.log_text, msg, tag)
+        win_text = self._log_win_text
+        if win_text is not None:
+            try:
+                self._write_log(win_text, msg, tag)
+            except tk.TclError:
+                self._log_win = self._log_win_text = None
         self.status_var.set(msg[:160])
+
+    def _style_log_widget(self, widget) -> None:
+        c = DARK if self.dark_var.get() else LIGHT
+        widget.configure(bg=c["field"], fg=c["fg"], insertbackground=c["fg"])
+        widget.tag_configure("warn", foreground=c["warn"])
+        widget.tag_configure("error", foreground=c["err"])
+
+    def on_popout_log(self) -> None:
+        """把執行記錄放到獨立視窗檢視（可自由調整大小、移到其他螢幕）。"""
+        win = self._log_win
+        try:
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        win = tk.Toplevel(self.root)
+        win.title(f"執行記錄 — TRPG_Translator [{APP_VERSION}]")
+        win.geometry("880x540")
+        win.minsize(480, 240)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        txt = ScrolledText(win, wrap="word", state="disabled", font=self.log_font)
+        txt.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self._style_dialog(win, None)
+        self._style_log_widget(txt)
+        txt.configure(state="normal")  # 回放既有記錄
+        for level, msg in self.log_buffer:
+            txt.insert("end", msg + "\n", self._tag_for(level))
+        txt.configure(state="disabled")
+        txt.see("end")
+        self._log_win, self._log_win_text = win, txt
+
+        def close() -> None:
+            self._log_win = self._log_win_text = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
 
     # ---------- 進度與統計 ----------
     def refresh_stats(self, once: bool = False) -> None:
@@ -1648,6 +1910,7 @@ class App:
             if not messagebox.askyesno("確定要結束？", msg):
                 return
             engine.abort_all()
+        engine.shutdown_ocr()
         self._stop_tray_icon()
         self.save_settings()
         self.root.destroy()

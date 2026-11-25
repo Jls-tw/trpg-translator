@@ -21,6 +21,7 @@
 - API Key 與設定會存在 ~/Library/Application Support/TRPG_Translator/，不會包在 App 裡。
 
 ## 注意
+- 「用本機 OCR 辨識圖片頁中的文字」需要另外安裝 rapidocr、onnxruntime、pypdfium2。打包好的 App 本身不含 OCR，但會自動使用 `~/Library/Application Support/TRPG_Translator/venv`（`.command` 啟動工具建立的專用環境）或電腦上的 python3 來辨識；沒裝時這個選項會自動不生效，其他功能不受影響。可執行 `安裝OCR功能_Mac.command` 安裝。
 - 系統提示詞存放在獨立的 `system_prompt.txt`，可在程式內按「檢視 / 編輯系統提示詞…」修改；打包成 App 後，這個檔案會建立在 `~/Library/Application Support/TRPG_Translator/`。
 - 本版本新增的功能（排程、強制停止、深色模式、自動切換模型、各模型分開計時等）在 Mac 上都可使用；只有「縮到系統匣」不支援（Mac 請直接用 Dock 縮小視窗），該選項在 Mac 版會自動隱藏。
 - 不要把 .env（內有 API Key）上傳到 GitHub；已附的 .gitignore 會擋住，但用網頁拖曳上傳時它不會生效，請自行確認沒有放進去。
@@ -29,4 +30,4 @@
 - 公開儲存庫使用標準 runner 通常免費；私人儲存庫有每月免費額度，macOS 的計時倍率較高，詳情請看 GitHub 計費說明。
 
 ## 版本
-- 目前版本 2.7.0，視窗標題會顯示「TRPG_Translator [版號]」。要發佈新版時，可在 GitHub 建立標籤（例如 v2.6.0）觸發自動打包。
+- 目前版本 2.12.0，視窗標題會顯示「TRPG_Translator [版號]」。要發佈新版時，可在 GitHub 建立標籤（例如 v2.12.0）觸發自動打包。
